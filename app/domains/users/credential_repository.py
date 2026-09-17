@@ -17,7 +17,6 @@ class UserCredentialRepository:
         result = await db.execute(
             select(UserCredential).where(UserCredential.user_id == user_id)
         )
-
         return result.scalar_one_or_none()
 
     async def get_by_id(
@@ -28,7 +27,6 @@ class UserCredentialRepository:
         result = await db.execute(
             select(UserCredential).where(UserCredential.id == credential_id)
         )
-
         return result.scalar_one_or_none()
 
     async def create(
@@ -37,9 +35,7 @@ class UserCredentialRepository:
         credential: UserCredential,
     ) -> UserCredential:
         db.add(credential)
-
         await db.flush()
-
         return credential
 
     async def delete(
@@ -48,7 +44,6 @@ class UserCredentialRepository:
         credential: UserCredential,
     ) -> None:
         await db.delete(credential)
-
         await db.flush()
 
     async def get_staff_users(
@@ -57,42 +52,31 @@ class UserCredentialRepository:
         search: str | None = None,
         include_super_admin: bool = False,
     ) -> list[User]:
-        query = select(User).options(
-            selectinload(User.credential),
-        )
+        staff_roles = [
+            UserRole.FRONT_DESK,
+            UserRole.GRAPHIC_LEAD,
+            UserRole.GRAPHIC_DESIGNER,
+        ]
 
         if include_super_admin:
-            query = query.where(
-                User.role.in_(
-                    [
-                        UserRole.SUPER_ADMIN,
-                        UserRole.FRONT_DESK,
-                        UserRole.GRAPHIC_LEAD,
-                        UserRole.GRAPHIC_DESIGNER,
-                    ]
-                )
+            staff_roles.append(UserRole.SUPER_ADMIN)
+
+        query = (
+            select(User)
+            .options(
+                selectinload(User.credential),
             )
-        else:
-            query = query.where(
-                User.role.in_(
-                    [
-                        UserRole.FRONT_DESK,
-                        UserRole.GRAPHIC_LEAD,
-                        UserRole.GRAPHIC_DESIGNER,
-                    ]
-                )
-            )
+            .where(User.role.in_(staff_roles))
+        )
 
         if search:
             search_value = f"%{search.strip()}%"
 
             query = query.where(
-                (
-                    User.first_name.ilike(search_value)
-                    | User.last_name.ilike(search_value)
-                    | User.username.ilike(search_value)
-                    | User.email.ilike(search_value)
-                )
+                User.first_name.ilike(search_value)
+                | User.last_name.ilike(search_value)
+                | User.username.ilike(search_value)
+                | User.email.ilike(search_value)
             )
 
         query = query.order_by(

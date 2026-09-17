@@ -159,7 +159,11 @@ class UserCredentialService:
                 credential,
             )
 
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
         return await self.get_staff_credential(
             db,
@@ -186,12 +190,17 @@ class UserCredentialService:
         if role == UserRole.SUPER_ADMIN:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="You cannot promote staff to Super Admin from this page.",
+                detail=("You cannot promote staff to Super Admin from this page."),
             )
 
         user.role = role
 
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
         await db.refresh(user)
 
         return user
@@ -215,7 +224,12 @@ class UserCredentialService:
 
         user.is_active = is_active
 
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
         await db.refresh(user)
 
         return user
