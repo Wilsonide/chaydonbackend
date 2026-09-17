@@ -102,15 +102,16 @@ class TaskService:
     async def get_all(
         self,
         db,
-        pagination,
+        page,
+        limit,
         search,
         status,
         priority,
     ):
         items, total = await self.repo.get_all(
             db,
-            page=pagination.page,
-            limit=pagination.limit,
+            page=page,
+            limit=limit,
             search=search,
             status=status,
             priority=priority,
@@ -119,8 +120,8 @@ class TaskService:
         return build_page(
             items=items,
             total=total,
-            page=pagination.page,
-            limit=pagination.limit,
+            page=page,
+            limit=limit,
         )
 
     async def get_by_id(
