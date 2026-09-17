@@ -21,7 +21,6 @@ class ProductionRepository:
         folder: ProductionFolder,
     ) -> ProductionFolder:
         db.add(folder)
-
         await db.flush()
 
         return folder
@@ -43,6 +42,30 @@ class ProductionRepository:
                 selectinload(ProductionFolder.tasks),
             )
             .where(ProductionFolder.id == folder_id)
+        )
+
+        return result.scalar_one_or_none()
+
+    # ============================================================
+    # GET PRODUCTION FOLDER METADATA
+    # ============================================================
+    #
+    # Used when the service only needs folder information such as:
+    # - id
+    # - production_number
+    # - created_at
+    # - folder_number
+    #
+    # This avoids loading files, activities, and tasks.
+    # ============================================================
+
+    async def get_basic_by_id(
+        self,
+        db: AsyncSession,
+        folder_id: str,
+    ) -> ProductionFolder | None:
+        result = await db.execute(
+            select(ProductionFolder).where(ProductionFolder.id == folder_id)
         )
 
         return result.scalar_one_or_none()
@@ -75,18 +98,14 @@ class ProductionRepository:
         search: str | None = None,
         status=None,
     ):
-        query = select(ProductionFolder).options(
-            selectinload(ProductionFolder.files),
-            selectinload(ProductionFolder.activities),
-            selectinload(ProductionFolder.tasks),
-        )
+        # --------------------------------------------------------
+        # FILTERS
+        # --------------------------------------------------------
 
-        # --------------------------------------------------------
-        # Search
-        # --------------------------------------------------------
+        filters = []
 
         if search:
-            query = query.where(
+            filters.append(
                 ilike_search(
                     search,
                     ProductionFolder.title,
@@ -97,30 +116,44 @@ class ProductionRepository:
                 )
             )
 
-        # --------------------------------------------------------
-        # Status filter
-        # --------------------------------------------------------
-
         if status:
-            query = query.where(ProductionFolder.status == status)
+            filters.append(ProductionFolder.status == status)
 
         # --------------------------------------------------------
-        # Total count
+        # TOTAL COUNT
         # --------------------------------------------------------
 
-        total = await db.scalar(select(func.count()).select_from(query.subquery()))
+        count_query = select(func.count(ProductionFolder.id))
+
+        if filters:
+            count_query = count_query.where(*filters)
+
+        total = await db.scalar(count_query)
 
         # --------------------------------------------------------
-        # Paginated result
+        # PAGINATED DATA
         # --------------------------------------------------------
 
-        result = await db.execute(
+        query = select(ProductionFolder).options(
+            selectinload(ProductionFolder.files),
+            selectinload(ProductionFolder.activities),
+            selectinload(ProductionFolder.tasks),
+        )
+
+        if filters:
+            query = query.where(*filters)
+
+        query = (
             query.order_by(ProductionFolder.created_at.desc())
             .offset((page - 1) * limit)
             .limit(limit)
         )
 
-        return list(result.scalars().all()), total or 0
+        result = await db.execute(query)
+
+        folders = list(result.scalars().all())
+
+        return folders, total or 0
 
     # ============================================================
     # ADD ACTIVITY
@@ -133,9 +166,7 @@ class ProductionRepository:
     ) -> ProductionActivity:
         db.add(activity)
 
-        await db.commit()
-
-        await db.refresh(activity)
+        await db.flush()
 
         return activity
 
@@ -151,7 +182,6 @@ class ProductionRepository:
         db.add(file)
 
         await db.commit()
-
         await db.refresh(file)
 
         return file
@@ -181,5 +211,4 @@ class ProductionRepository:
         production_file: ProductionFile,
     ):
         await db.delete(production_file)
-
         await db.commit()

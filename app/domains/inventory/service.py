@@ -28,7 +28,11 @@ class InventoryService:
         data: InventoryCreate,
     ):
         item = InventoryItem(**data.model_dump())
-        return await self.repo.create(db, item)
+
+        return await self.repo.create(
+            db,
+            item,
+        )
 
     async def get_all(
         self,
@@ -55,12 +59,15 @@ class InventoryService:
         item_id: str,
         data: InventoryUpdate,
     ):
-        item = await self.repo.get_by_id(db, item_id)
+        item = await self.repo.get_by_id(
+            db,
+            item_id,
+        )
 
         if not item:
             raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "Inventory item not found",
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Inventory item not found",
             )
 
         for key, value in data.model_dump(
@@ -68,7 +75,10 @@ class InventoryService:
         ).items():
             setattr(item, key, value)
 
-        return await self.repo.save(db, item)
+        return await self.repo.save(
+            db,
+            item,
+        )
 
     async def add_stock(
         self,
@@ -77,27 +87,39 @@ class InventoryService:
         data: StockMovementCreate,
         user_id: str,
     ):
-        item = await self.repo.get_by_id(db, item_id)
+        item = await self.repo.get_by_id(
+            db,
+            item_id,
+        )
 
         if not item:
-            raise HTTPException(404, "Inventory item not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Inventory item not found",
+            )
 
         if data.quantity <= 0:
-            raise HTTPException(400, "Quantity must be greater than zero")
+            raise HTTPException(
+                status_code=400,
+                detail="Quantity must be greater than zero",
+            )
 
         if data.movement_type == MovementType.STOCK_IN:
             item.quantity += data.quantity
 
         elif data.movement_type == MovementType.STOCK_OUT:
             if item.quantity < data.quantity:
-                raise HTTPException(400, "Insufficient stock")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Insufficient stock",
+                )
 
             item.quantity -= data.quantity
 
         else:
             raise HTTPException(
-                400,
-                "Use manual adjustment endpoint for ADJUSTMENT",
+                status_code=400,
+                detail=("Use manual adjustment endpoint for ADJUSTMENT"),
             )
 
         movement = StockMovement(
@@ -109,8 +131,11 @@ class InventoryService:
             production_folder_id=data.production_folder_id,
         )
 
-        await self.repo.save(db, item)
-        return await self.repo.add_movement(db, movement)
+        return await self.repo.save_with_movement(
+            db,
+            item,
+            movement,
+        )
 
     async def manual_adjustment(
         self,
@@ -119,24 +144,34 @@ class InventoryService:
         data: ManualAdjustment,
         user_id: str,
     ):
-        item = await self.repo.get_by_id(db, item_id)
+        item = await self.repo.get_by_id(
+            db,
+            item_id,
+        )
 
         if not item:
-            raise HTTPException(404, "Inventory item not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Inventory item not found",
+            )
 
         old = item.quantity
+
         item.quantity = data.new_quantity
 
         movement = StockMovement(
             item_id=item.id,
             quantity=data.new_quantity,
             movement_type=MovementType.ADJUSTMENT,
-            reason=f"{data.reason} (Old:{old} New:{data.new_quantity})",
+            reason=(f"{data.reason} (Old:{old} New:{data.new_quantity})"),
             recorded_by=user_id,
         )
 
-        await self.repo.save(db, item)
-        return await self.repo.add_movement(db, movement)
+        return await self.repo.save_with_movement(
+            db,
+            item,
+            movement,
+        )
 
     async def consume_for_production(
         self,
@@ -145,15 +180,21 @@ class InventoryService:
         data: ProductionConsumption,
         user_id: str,
     ):
-        item = await self.repo.get_by_id(db, data.item_id)
+        item = await self.repo.get_by_id(
+            db,
+            data.item_id,
+        )
 
         if not item:
-            raise HTTPException(404, "Inventory item not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Inventory item not found",
+            )
 
         if item.quantity < data.quantity:
             raise HTTPException(
-                400,
-                f"Only {item.quantity} {item.unit} available",
+                status_code=400,
+                detail=(f"Only {item.quantity} {item.unit} available"),
             )
 
         item.quantity -= data.quantity
@@ -167,8 +208,11 @@ class InventoryService:
             production_folder_id=folder_id,
         )
 
-        await self.repo.save(db, item)
-        return await self.repo.add_movement(db, movement)
+        return await self.repo.save_with_movement(
+            db,
+            item,
+            movement,
+        )
 
     async def get_movements(
         self,
@@ -176,10 +220,16 @@ class InventoryService:
         item_id: str,
         pagination: PaginationParams,
     ):
-        item = await self.repo.get_by_id(db, item_id)
+        item = await self.repo.get_by_id(
+            db,
+            item_id,
+        )
 
         if not item:
-            raise HTTPException(404, "Inventory item not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Inventory item not found",
+            )
 
         movements, total = await self.repo.get_movements(
             db,
@@ -194,8 +244,14 @@ class InventoryService:
             limit=pagination.limit,
         )
 
-    async def low_stock(self, db: AsyncSession):
+    async def low_stock(
+        self,
+        db: AsyncSession,
+    ):
         return await self.repo.get_low_stock(db)
 
-    async def dashboard(self, db: AsyncSession):
+    async def dashboard(
+        self,
+        db: AsyncSession,
+    ):
         return await self.repo.dashboard_summary(db)

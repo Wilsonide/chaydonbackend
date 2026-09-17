@@ -1,6 +1,7 @@
 import enum
+from datetime import datetime
 
-from sqlalchemy import Boolean, Enum, String
+from sqlalchemy import Boolean, DateTime, Enum, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDMixin
@@ -53,6 +54,21 @@ class User(UUIDMixin, TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
+        nullable=False,
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    last_activity_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    is_online: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
         nullable=False,
     )
 

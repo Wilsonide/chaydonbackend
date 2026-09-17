@@ -7,6 +7,10 @@ from app.shared.search import ilike_search
 
 
 class OrderRepository:
+    # ============================================================
+    # CREATE ORDER
+    # ============================================================
+
     async def create(
         self,
         db: AsyncSession,
@@ -27,23 +31,23 @@ class OrderRepository:
 
         return result.scalar_one()
 
+    # ============================================================
+    # UPDATE ORDER
+    # ============================================================
+
     async def update(
         self,
         db: AsyncSession,
         order: Order,
     ) -> Order:
         await db.commit()
+        await db.refresh(order)
 
-        result = await db.execute(
-            select(Order)
-            .options(
-                selectinload(Order.files),
-                selectinload(Order.customer),
-            )
-            .where(Order.id == order.id)
-        )
+        return order
 
-        return result.scalar_one()
+    # ============================================================
+    # GET SINGLE ORDER
+    # ============================================================
 
     async def get_by_id(
         self,
@@ -61,6 +65,10 @@ class OrderRepository:
 
         return result.scalar_one_or_none()
 
+    # ============================================================
+    # GET ALL ORDERS
+    # ============================================================
+
     async def get_all(
         self,
         db: AsyncSession,
@@ -70,10 +78,10 @@ class OrderRepository:
         search: str | None = None,
         status=None,
     ):
-        query = select(Order)
+        filters = []
 
         if search:
-            query = query.where(
+            filters.append(
                 ilike_search(
                     search,
                     Order.title,
@@ -81,24 +89,46 @@ class OrderRepository:
             )
 
         if status:
-            query = query.where(Order.status == status)
+            filters.append(Order.status == status)
 
-        total = await db.scalar(select(func.count()).select_from(query.subquery()))
+        # --------------------------------------------------------
+        # TOTAL COUNT
+        # --------------------------------------------------------
 
-        result = await db.execute(
-            query.options(
-                selectinload(Order.files),
-                selectinload(Order.customer),
-            )
-            .order_by(Order.created_at.desc())
+        count_query = select(func.count(Order.id))
+
+        if filters:
+            count_query = count_query.where(*filters)
+
+        total = await db.scalar(count_query)
+
+        # --------------------------------------------------------
+        # PAGINATED DATA
+        # --------------------------------------------------------
+
+        query = select(Order).options(
+            selectinload(Order.files),
+            selectinload(Order.customer),
+        )
+
+        if filters:
+            query = query.where(*filters)
+
+        query = (
+            query.order_by(Order.created_at.desc())
             .offset((page - 1) * limit)
             .limit(limit)
         )
 
-        return (
-            list(result.scalars().all()),
-            total,
-        )
+        result = await db.execute(query)
+
+        orders = list(result.scalars().all())
+
+        return orders, total or 0
+
+    # ============================================================
+    # CREATE ORDER FILE
+    # ============================================================
 
     async def create_file(
         self,
@@ -108,10 +138,13 @@ class OrderRepository:
         db.add(file)
 
         await db.commit()
-
         await db.refresh(file)
 
         return file
+
+    # ============================================================
+    # GET ORDER FILES
+    # ============================================================
 
     async def get_files(
         self,
@@ -126,6 +159,10 @@ class OrderRepository:
 
         return list(result.scalars().all())
 
+    # ============================================================
+    # GET SINGLE ORDER FILE
+    # ============================================================
+
     async def get_file(
         self,
         db: AsyncSession,
@@ -135,14 +172,21 @@ class OrderRepository:
 
         return result.scalar_one_or_none()
 
+    # ============================================================
+    # DELETE ORDER FILE
+    # ============================================================
+
     async def delete_file(
         self,
         db: AsyncSession,
         file: OrderFile,
     ):
         await db.delete(file)
-
         await db.commit()
+
+    # ============================================================
+    # DELETE ORDER
+    # ============================================================
 
     async def delete(
         self,
@@ -151,3 +195,16 @@ class OrderRepository:
     ):
         await db.delete(order)
         await db.commit()
+
+    # ============================================================
+    # CHECK ORDER EXISTS
+    # ============================================================
+
+    async def exists(
+        self,
+        db: AsyncSession,
+        order_id: str,
+    ) -> bool:
+        result = await db.scalar(select(Order.id).where(Order.id == order_id))
+
+        return result is not None

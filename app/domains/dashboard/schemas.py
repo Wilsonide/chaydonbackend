@@ -1,6 +1,22 @@
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel
+
+from app.domains.users.models import UserRole
+
+
+class StaffActivity(BaseModel):
+    id: str
+    name: str
+    username: str
+    role: UserRole
+    is_online: bool
+    last_login: datetime | None
+    last_activity: datetime | None
+    current_task: str | None
+    task_status: str | None
+
 
 # ============================================================
 # SUPER ADMIN
@@ -74,6 +90,7 @@ class SuperAdminDashboard(BaseModel):
     production: SuperAdminProduction
     tasks: SuperAdminTasks
     financial: SuperAdminFinancial
+    staff: list[StaffActivity]
 
 
 # ============================================================
@@ -128,6 +145,7 @@ class GraphicLeadDashboard(BaseModel):
     approved_for_print: int
     printing: int
     completed: int
+    staff: list[StaffActivity]
 
 
 # ============================================================

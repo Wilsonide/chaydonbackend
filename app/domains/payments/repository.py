@@ -14,21 +14,16 @@ class PaymentRepository:
         db: AsyncSession,
         payment: Payment,
     ):
+        """
+        Add the payment to the current transaction.
+
+        The service commits the transaction because payment creation
+        also updates the related invoice.
+        """
         db.add(payment)
         await db.flush()
 
-        # Make sure relationships required by the response schema
-        # are loaded before returning the payment.
-        result = await db.execute(
-            select(Payment)
-            .options(
-                selectinload(Payment.recorder),
-                selectinload(Payment.order).selectinload(Order.customer),
-            )
-            .where(Payment.id == payment.id)
-        )
-
-        return result.scalar_one()
+        return payment
 
     async def get_by_id(
         self,
@@ -76,8 +71,14 @@ class PaymentRepository:
         if search:
             query = query.where(
                 or_(
-                    ilike_search(search, Customer.name),
-                    ilike_search(search, Order.title),
+                    ilike_search(
+                        search,
+                        Customer.name,
+                    ),
+                    ilike_search(
+                        search,
+                        Order.title,
+                    ),
                 )
             )
 

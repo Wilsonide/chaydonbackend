@@ -1,3 +1,5 @@
+import time
+
 from app.domains.dashboard.repository import DashboardRepository
 from app.domains.dashboard.schemas import (
     FrontDeskDashboard,
@@ -29,7 +31,25 @@ class DashboardService:
         # ========================================================
 
         if role == UserRole.SUPER_ADMIN:
+            start = time.perf_counter()
+
             data = await self.repo.super_admin_summary(db)
+
+            summary_time = time.perf_counter() - start
+
+            print(f"[DASHBOARD] super_admin_summary: {summary_time:.3f}s")
+
+            start = time.perf_counter()
+
+            staff = await self.repo.staff_activity(db)
+
+            staff_time = time.perf_counter() - start
+
+            print(f"[DASHBOARD] staff_activity: {staff_time:.3f}s")
+
+            total_time = summary_time + staff_time
+
+            print(f"[DASHBOARD] repository total: {total_time:.3f}s")
 
             return SuperAdminDashboard(
                 business=SuperAdminBusiness(
@@ -81,6 +101,7 @@ class DashboardService:
                     paid=data["paid"],
                     void=data["void"],
                 ),
+                staff=staff,
             )
 
         # ========================================================
@@ -113,6 +134,8 @@ class DashboardService:
         if role == UserRole.GRAPHIC_LEAD:
             data = await self.repo.graphic_lead_summary(db)
 
+            staff = await self.repo.staff_activity(db)
+
             return GraphicLeadDashboard(
                 design_queue=data["design_queue"],
                 pending_reviews=data["pending_reviews"],
@@ -130,6 +153,7 @@ class DashboardService:
                 approved_for_print=data["approved_for_print"],
                 printing=data["printing"],
                 completed=data["completed"],
+                staff=staff,
             )
 
         # ========================================================

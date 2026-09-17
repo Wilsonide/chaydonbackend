@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.customers.models import Customer
@@ -13,6 +13,7 @@ from app.domains.production.models import (
     ProductionStatus,
 )
 from app.domains.tasks.models import Task, TaskStatus
+from app.domains.users.models import User, UserRole
 
 NIGERIA_TZ = ZoneInfo("Africa/Lagos")
 
@@ -21,24 +22,19 @@ def now_ng() -> datetime:
     return datetime.now(NIGERIA_TZ)
 
 
-def nigeria_day_boundaries():
-    now = now_ng()
-
+def nigeria_day_boundaries(now: datetime):
     today_start = now.replace(
         hour=0,
         minute=0,
         second=0,
         microsecond=0,
     )
-
     tomorrow_start = today_start + timedelta(days=1)
 
     return today_start, tomorrow_start
 
 
-def nigeria_month_boundaries():
-    now = now_ng()
-
+def nigeria_month_boundaries(now: datetime):
     month_start = now.replace(
         day=1,
         hour=0,
@@ -69,333 +65,296 @@ class DashboardRepository:
         self,
         db: AsyncSession,
     ):
-        today_start, tomorrow_start = nigeria_day_boundaries()
-        month_start, next_month = nigeria_month_boundaries()
-        today = now_ng().date()
         now = now_ng()
+        today = now.date()
 
-        # --------------------------------------------------------
-        # BUSINESS TOTALS
-        # --------------------------------------------------------
+        today_start, tomorrow_start = nigeria_day_boundaries(now)
+        month_start, next_month = nigeria_month_boundaries(now)
 
-        customers = await db.scalar(select(func.count(Customer.id))) or 0
+        active_order_statuses = [
+            OrderStatus.RECEIVED,
+            OrderStatus.REVIEWING,
+            OrderStatus.READY_FOR_PRODUCTION,
+            OrderStatus.IN_PRODUCTION,
+        ]
 
-        orders = await db.scalar(select(func.count(Order.id))) or 0
+        completed_or_cancelled = [
+            OrderStatus.COMPLETED,
+            OrderStatus.CANCELLED,
+        ]
 
-        # --------------------------------------------------------
-        # TODAY
-        # --------------------------------------------------------
+        # ========================================================
+        # BUSINESS
+        #
+        # Everything is collected in ONE database round trip.
+        # ========================================================
 
-        new_orders_today = (
-            await db.scalar(
-                select(func.count(Order.id)).where(
-                    Order.created_at >= today_start,
-                    Order.created_at < tomorrow_start,
-                )
-            )
-            or 0
-        )
-
-        payments_today = (
-            await db.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(Payment.amount),
-                        0,
-                    )
-                ).where(
-                    Payment.created_at >= today_start,
-                    Payment.created_at < tomorrow_start,
-                )
-            )
-            or 0
-        )
-
-        new_customers_today = (
-            await db.scalar(
-                select(func.count(Customer.id)).where(
-                    Customer.created_at >= today_start,
-                    Customer.created_at < tomorrow_start,
-                )
-            )
-            or 0
-        )
-
-        # --------------------------------------------------------
-        # REVENUE
-        # --------------------------------------------------------
-
-        revenue_this_month = (
-            await db.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(Payment.amount),
-                        0,
-                    )
-                ).where(
-                    Payment.created_at >= month_start,
-                    Payment.created_at < next_month,
-                )
-            )
-            or 0
-        )
-
-        # --------------------------------------------------------
-        # FINANCIAL TOTALS
-        # --------------------------------------------------------
-
-        invoice_total = (
-            await db.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(Invoice.total_amount),
-                        0,
-                    )
-                )
-            )
-            or 0
-        )
-
-        payments_total = (
-            await db.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(Payment.amount),
-                        0,
-                    )
-                )
-            )
-            or 0
-        )
-
-        outstanding = invoice_total - payments_total
-
-        # --------------------------------------------------------
-        # ORDER PIPELINE
-        # --------------------------------------------------------
-
-        order_counts_result = await db.execute(
+        business_query = select(
+            # ----------------------------------------------------
+            # BUSINESS TOTALS
+            # ----------------------------------------------------
+            select(func.count(Customer.id)).scalar_subquery().label("customers"),
+            select(func.count(Order.id)).scalar_subquery().label("orders"),
             select(
-                Order.status,
-                func.count(Order.id),
-            ).group_by(Order.status)
-        )
-
-        order_counts = {
-            order_status: count for order_status, count in order_counts_result.all()
-        }
-
-        # --------------------------------------------------------
-        # ORDER DUE / OVERDUE
-        # --------------------------------------------------------
-
-        overdue_orders = (
-            await db.scalar(
-                select(func.count(Order.id)).where(
-                    Order.due_date < today,
-                    Order.due_date.is_not(None),
-                    Order.status.notin_(
-                        [
-                            OrderStatus.COMPLETED,
-                            OrderStatus.CANCELLED,
-                        ]
-                    ),
+                func.coalesce(
+                    func.sum(Payment.amount),
+                    0,
                 )
             )
-            or 0
-        )
-
-        due_today = (
-            await db.scalar(
-                select(func.count(Order.id)).where(
-                    Order.due_date == today,
-                    Order.status.notin_(
-                        [
-                            OrderStatus.COMPLETED,
-                            OrderStatus.CANCELLED,
-                        ]
-                    ),
+            .where(
+                Payment.created_at >= month_start,
+                Payment.created_at < next_month,
+            )
+            .scalar_subquery()
+            .label("revenue_this_month"),
+            select(
+                func.coalesce(
+                    func.sum(Invoice.balance_due),
+                    0,
                 )
             )
-            or 0
-        )
-
-        # --------------------------------------------------------
-        # PRODUCTION PIPELINE
-        # --------------------------------------------------------
-
-        production_counts_result = await db.execute(
+            .scalar_subquery()
+            .label("outstanding_balance"),
+            select(func.count(Order.id))
+            .where(
+                Order.created_at >= today_start,
+                Order.created_at < tomorrow_start,
+            )
+            .scalar_subquery()
+            .label("new_orders_today"),
             select(
-                ProductionFolder.status,
-                func.count(ProductionFolder.id),
-            ).group_by(ProductionFolder.status)
-        )
-
-        production_counts = {
-            production_status: count
-            for production_status, count in production_counts_result.all()
-        }
-
-        # --------------------------------------------------------
-        # TASK PIPELINE
-        # --------------------------------------------------------
-
-        task_counts_result = await db.execute(
-            select(
-                Task.status,
-                func.count(Task.id),
-            ).group_by(Task.status)
-        )
-
-        task_counts = {
-            task_status: count for task_status, count in task_counts_result.all()
-        }
-
-        overdue_tasks = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.deadline < now,
-                    Task.status != TaskStatus.APPROVED,
+                func.coalesce(
+                    func.sum(Payment.amount),
+                    0,
                 )
             )
-            or 0
-        )
-
-        # --------------------------------------------------------
-        # INVOICE PIPELINE
-        # --------------------------------------------------------
-
-        invoice_counts_result = await db.execute(
+            .where(
+                Payment.created_at >= today_start,
+                Payment.created_at < tomorrow_start,
+            )
+            .scalar_subquery()
+            .label("payments_today"),
+            select(func.count(Customer.id))
+            .where(
+                Customer.created_at >= today_start,
+                Customer.created_at < tomorrow_start,
+            )
+            .scalar_subquery()
+            .label("new_customers_today"),
+            select(func.count(Order.id))
+            .where(
+                Order.due_date < today,
+                Order.due_date.is_not(None),
+                Order.status.notin_(completed_or_cancelled),
+            )
+            .scalar_subquery()
+            .label("overdue_orders"),
+            select(func.count(Order.id))
+            .where(
+                Order.due_date == today,
+                Order.status.notin_(completed_or_cancelled),
+            )
+            .scalar_subquery()
+            .label("due_today"),
+            # ----------------------------------------------------
+            # ORDER PIPELINE
+            # ----------------------------------------------------
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.RECEIVED)
+            .scalar_subquery()
+            .label("received_orders"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.REVIEWING)
+            .scalar_subquery()
+            .label("reviewing_orders"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.READY_FOR_PRODUCTION)
+            .scalar_subquery()
+            .label("ready_for_production"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.IN_PRODUCTION)
+            .scalar_subquery()
+            .label("in_production"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.COMPLETED)
+            .scalar_subquery()
+            .label("completed_orders"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.CANCELLED)
+            .scalar_subquery()
+            .label("cancelled_orders"),
+            # ----------------------------------------------------
+            # PRODUCTION PIPELINE
+            # ----------------------------------------------------
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.CREATED)
+            .scalar_subquery()
+            .label("production_created"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.WAITING_FOR_REQUIREMENTS)
+            .scalar_subquery()
+            .label("production_waiting"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.READY_FOR_DESIGN)
+            .scalar_subquery()
+            .label("production_ready_for_design"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.IN_DESIGN)
+            .scalar_subquery()
+            .label("production_in_design"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.DESIGN_REVIEW)
+            .scalar_subquery()
+            .label("production_design_review"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.APPROVED_FOR_PRINT)
+            .scalar_subquery()
+            .label("production_approved_for_print"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.PRINTING)
+            .scalar_subquery()
+            .label("production_printing"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.COMPLETED)
+            .scalar_subquery()
+            .label("production_completed"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.CANCELLED)
+            .scalar_subquery()
+            .label("production_cancelled"),
+            # ----------------------------------------------------
+            # TASK PIPELINE
+            # ----------------------------------------------------
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.ASSIGNED)
+            .scalar_subquery()
+            .label("assigned_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.IN_PROGRESS)
+            .scalar_subquery()
+            .label("in_progress_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.SUBMITTED)
+            .scalar_subquery()
+            .label("submitted_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.REVISION_REQUIRED)
+            .scalar_subquery()
+            .label("revision_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.APPROVED)
+            .scalar_subquery()
+            .label("approved_tasks"),
+            select(func.count(Task.id))
+            .where(
+                Task.deadline < now,
+                Task.deadline.is_not(None),
+                Task.status != TaskStatus.APPROVED,
+            )
+            .scalar_subquery()
+            .label("overdue_tasks"),
+            # ----------------------------------------------------
+            # INVOICE PIPELINE
+            # ----------------------------------------------------
+            select(func.count(Invoice.id))
+            .where(Invoice.status == InvoiceStatus.UNPAID)
+            .scalar_subquery()
+            .label("unpaid_invoices"),
+            select(func.count(Invoice.id))
+            .where(Invoice.status == InvoiceStatus.PARTIALLY_PAID)
+            .scalar_subquery()
+            .label("partially_paid_invoices"),
+            select(func.count(Invoice.id))
+            .where(Invoice.status == InvoiceStatus.PAID)
+            .scalar_subquery()
+            .label("paid_invoices"),
+            select(func.count(Invoice.id))
+            .where(Invoice.status == InvoiceStatus.VOID)
+            .scalar_subquery()
+            .label("void_invoices"),
+            # ----------------------------------------------------
+            # FINANCIAL TOTALS
+            # ----------------------------------------------------
             select(
-                Invoice.status,
-                func.count(Invoice.id),
-            ).group_by(Invoice.status)
+                func.coalesce(
+                    func.sum(Invoice.total_amount),
+                    0,
+                )
+            )
+            .scalar_subquery()
+            .label("invoice_total"),
+            select(
+                func.coalesce(
+                    func.sum(Payment.amount),
+                    0,
+                )
+            )
+            .scalar_subquery()
+            .label("payments_total"),
         )
 
-        invoice_counts = {
-            invoice_status: count
-            for invoice_status, count in invoice_counts_result.all()
-        }
+        result = await db.execute(business_query)
+        data = result.one()
 
-        # --------------------------------------------------------
+        # ========================================================
         # RETURN
-        # --------------------------------------------------------
+        # ========================================================
 
         return {
-            # Business
-            "customers": customers,
-            "orders": orders,
-            "revenue": revenue_this_month,
-            "outstanding": outstanding,
-            # Today
-            "new_orders_today": new_orders_today,
-            "payments_today": payments_today,
-            "new_customers_today": new_customers_today,
-            # Order pipeline
-            "received_orders": order_counts.get(
-                OrderStatus.RECEIVED,
-                0,
-            ),
-            "reviewing_orders": order_counts.get(
-                OrderStatus.REVIEWING,
-                0,
-            ),
-            "ready_for_production": order_counts.get(
-                OrderStatus.READY_FOR_PRODUCTION,
-                0,
-            ),
-            "in_production": order_counts.get(
-                OrderStatus.IN_PRODUCTION,
-                0,
-            ),
-            "completed_orders": order_counts.get(
-                OrderStatus.COMPLETED,
-                0,
-            ),
-            "cancelled_orders": order_counts.get(
-                OrderStatus.CANCELLED,
-                0,
-            ),
-            "overdue_orders": overdue_orders,
-            "due_today": due_today,
-            # Production pipeline
-            "created": production_counts.get(
-                ProductionStatus.CREATED,
-                0,
-            ),
-            "waiting": production_counts.get(
-                ProductionStatus.WAITING_FOR_REQUIREMENTS,
-                0,
-            ),
-            "ready_for_design": production_counts.get(
-                ProductionStatus.READY_FOR_DESIGN,
-                0,
-            ),
-            "in_design": production_counts.get(
-                ProductionStatus.IN_DESIGN,
-                0,
-            ),
-            "design_review": production_counts.get(
-                ProductionStatus.DESIGN_REVIEW,
-                0,
-            ),
-            "approved_for_print": production_counts.get(
-                ProductionStatus.APPROVED_FOR_PRINT,
-                0,
-            ),
-            "printing": production_counts.get(
-                ProductionStatus.PRINTING,
-                0,
-            ),
-            "completed": production_counts.get(
-                ProductionStatus.COMPLETED,
-                0,
-            ),
-            "production_cancelled": production_counts.get(
-                ProductionStatus.CANCELLED,
-                0,
-            ),
-            # Task pipeline
-            "assigned": task_counts.get(
-                TaskStatus.ASSIGNED,
-                0,
-            ),
-            "in_progress": task_counts.get(
-                TaskStatus.IN_PROGRESS,
-                0,
-            ),
-            "pending_review": task_counts.get(
-                TaskStatus.SUBMITTED,
-                0,
-            ),
-            "revision": task_counts.get(
-                TaskStatus.REVISION_REQUIRED,
-                0,
-            ),
-            "approved": task_counts.get(
-                TaskStatus.APPROVED,
-                0,
-            ),
-            "overdue": overdue_tasks,
-            # Financial pipeline
-            "invoice_total": invoice_total,
-            "payments_total": payments_total,
-            "unpaid": invoice_counts.get(
-                InvoiceStatus.UNPAID,
-                0,
-            ),
-            "partially_paid": invoice_counts.get(
-                InvoiceStatus.PARTIALLY_PAID,
-                0,
-            ),
-            "paid": invoice_counts.get(
-                InvoiceStatus.PAID,
-                0,
-            ),
-            "void": invoice_counts.get(
-                InvoiceStatus.VOID,
-                0,
-            ),
+            # ----------------------------------------------------
+            # BUSINESS
+            # ----------------------------------------------------
+            "customers": data.customers,
+            "orders": data.orders,
+            "revenue": data.revenue_this_month,
+            "outstanding": data.outstanding_balance,
+            # ----------------------------------------------------
+            # TODAY
+            # ----------------------------------------------------
+            "new_orders_today": data.new_orders_today,
+            "payments_today": data.payments_today,
+            "new_customers_today": data.new_customers_today,
+            # ----------------------------------------------------
+            # ORDERS
+            # ----------------------------------------------------
+            "received_orders": data.received_orders,
+            "reviewing_orders": data.reviewing_orders,
+            "ready_for_production": data.ready_for_production,
+            "in_production": data.in_production,
+            "completed_orders": data.completed_orders,
+            "cancelled_orders": data.cancelled_orders,
+            "overdue_orders": data.overdue_orders,
+            "due_today": data.due_today,
+            # ----------------------------------------------------
+            # PRODUCTION
+            # ----------------------------------------------------
+            "created": data.production_created,
+            "waiting": data.production_waiting,
+            "ready_for_design": data.production_ready_for_design,
+            "in_design": data.production_in_design,
+            "design_review": data.production_design_review,
+            "approved_for_print": data.production_approved_for_print,
+            "printing": data.production_printing,
+            "completed": data.production_completed,
+            "production_cancelled": data.production_cancelled,
+            # ----------------------------------------------------
+            # TASKS
+            # ----------------------------------------------------
+            "assigned": data.assigned_tasks,
+            "in_progress": data.in_progress_tasks,
+            "pending_review": data.submitted_tasks,
+            "revision": data.revision_tasks,
+            "approved": data.approved_tasks,
+            "overdue": data.overdue_tasks,
+            # ----------------------------------------------------
+            # FINANCIAL
+            # ----------------------------------------------------
+            "invoice_total": data.invoice_total,
+            "payments_total": data.payments_total,
+            "unpaid": data.unpaid_invoices,
+            "partially_paid": data.partially_paid_invoices,
+            "paid": data.paid_invoices,
+            "void": data.void_invoices,
         }
 
     # ============================================================
@@ -406,179 +365,125 @@ class DashboardRepository:
         self,
         db: AsyncSession,
     ):
-        today_start, tomorrow_start = nigeria_day_boundaries()
-        today = now_ng().date()
+        now = now_ng()
+        today = now.date()
 
-        # --------------------------------------------------------
-        # TODAY
-        # --------------------------------------------------------
+        today_start, tomorrow_start = nigeria_day_boundaries(now)
 
-        today_orders = (
-            await db.scalar(
-                select(func.count(Order.id)).where(
-                    Order.created_at >= today_start,
-                    Order.created_at < tomorrow_start,
-                )
+        completed_or_cancelled = [
+            OrderStatus.COMPLETED,
+            OrderStatus.CANCELLED,
+        ]
+
+        # ========================================================
+        # ONE DATABASE ROUND TRIP
+        # ========================================================
+
+        query = select(
+            # Today orders
+            select(func.count(Order.id))
+            .where(
+                Order.created_at >= today_start,
+                Order.created_at < tomorrow_start,
             )
-            or 0
-        )
-
-        today_payments = (
-            await db.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(Payment.amount),
-                        0,
-                    )
-                ).where(
-                    Payment.created_at >= today_start,
-                    Payment.created_at < tomorrow_start,
-                )
-            )
-            or 0
-        )
-
-        new_customers = (
-            await db.scalar(
-                select(func.count(Customer.id)).where(
-                    Customer.created_at >= today_start,
-                    Customer.created_at < tomorrow_start,
-                )
-            )
-            or 0
-        )
-
-        # --------------------------------------------------------
-        # OUTSTANDING
-        # --------------------------------------------------------
-
-        invoice_total = (
-            await db.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(Invoice.total_amount),
-                        0,
-                    )
-                )
-            )
-            or 0
-        )
-
-        payments_total = (
-            await db.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(Payment.amount),
-                        0,
-                    )
-                )
-            )
-            or 0
-        )
-
-        outstanding = invoice_total - payments_total
-
-        # --------------------------------------------------------
-        # ORDER PIPELINE
-        # --------------------------------------------------------
-
-        order_counts_result = await db.execute(
+            .scalar_subquery()
+            .label("today_orders"),
+            # Today payments
             select(
-                Order.status,
-                func.count(Order.id),
-            ).group_by(Order.status)
-        )
-
-        order_counts = {
-            order_status: count for order_status, count in order_counts_result.all()
-        }
-
-        # --------------------------------------------------------
-        # DUE ORDERS
-        # --------------------------------------------------------
-
-        overdue_orders = (
-            await db.scalar(
-                select(func.count(Order.id)).where(
-                    Order.due_date < today,
-                    Order.due_date.is_not(None),
-                    Order.status.notin_(
-                        [
-                            OrderStatus.COMPLETED,
-                            OrderStatus.CANCELLED,
-                        ]
-                    ),
+                func.coalesce(
+                    func.sum(Payment.amount),
+                    0,
                 )
             )
-            or 0
-        )
-
-        due_today = (
-            await db.scalar(
-                select(func.count(Order.id)).where(
-                    Order.due_date == today,
-                    Order.status.notin_(
-                        [
-                            OrderStatus.COMPLETED,
-                            OrderStatus.CANCELLED,
-                        ]
-                    ),
-                )
+            .where(
+                Payment.created_at >= today_start,
+                Payment.created_at < tomorrow_start,
             )
-            or 0
-        )
-
-        # --------------------------------------------------------
-        # INVOICE PIPELINE
-        # --------------------------------------------------------
-
-        invoice_counts_result = await db.execute(
+            .scalar_subquery()
+            .label("today_payments"),
+            # Outstanding
             select(
-                Invoice.status,
-                func.count(Invoice.id),
-            ).group_by(Invoice.status)
+                func.coalesce(
+                    func.sum(Invoice.balance_due),
+                    0,
+                )
+            )
+            .scalar_subquery()
+            .label("outstanding"),
+            # New customers
+            select(func.count(Customer.id))
+            .where(
+                Customer.created_at >= today_start,
+                Customer.created_at < tomorrow_start,
+            )
+            .scalar_subquery()
+            .label("new_customers"),
+            # Overdue orders
+            select(func.count(Order.id))
+            .where(
+                Order.due_date < today,
+                Order.due_date.is_not(None),
+                Order.status.notin_(completed_or_cancelled),
+            )
+            .scalar_subquery()
+            .label("overdue_orders"),
+            # Due today
+            select(func.count(Order.id))
+            .where(
+                Order.due_date == today,
+                Order.status.notin_(completed_or_cancelled),
+            )
+            .scalar_subquery()
+            .label("due_today"),
+            # Order statuses
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.RECEIVED)
+            .scalar_subquery()
+            .label("received_orders"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.REVIEWING)
+            .scalar_subquery()
+            .label("reviewing_orders"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.READY_FOR_PRODUCTION)
+            .scalar_subquery()
+            .label("ready_for_production"),
+            select(func.count(Order.id))
+            .where(Order.status == OrderStatus.IN_PRODUCTION)
+            .scalar_subquery()
+            .label("in_production"),
+            # Invoice statuses
+            select(func.count(Invoice.id))
+            .where(Invoice.status == InvoiceStatus.UNPAID)
+            .scalar_subquery()
+            .label("unpaid_invoices"),
+            select(func.count(Invoice.id))
+            .where(Invoice.status == InvoiceStatus.PARTIALLY_PAID)
+            .scalar_subquery()
+            .label("partially_paid_invoices"),
+            select(func.count(Invoice.id))
+            .where(Invoice.status == InvoiceStatus.PAID)
+            .scalar_subquery()
+            .label("paid_invoices"),
         )
 
-        invoice_counts = {
-            invoice_status: count
-            for invoice_status, count in invoice_counts_result.all()
-        }
+        result = await db.execute(query)
+        data = result.one()
 
         return {
-            "today_orders": today_orders,
-            "today_payments": today_payments,
-            "outstanding": outstanding,
-            "new_customers": new_customers,
-            "received_orders": order_counts.get(
-                OrderStatus.RECEIVED,
-                0,
-            ),
-            "reviewing_orders": order_counts.get(
-                OrderStatus.REVIEWING,
-                0,
-            ),
-            "ready_for_production": order_counts.get(
-                OrderStatus.READY_FOR_PRODUCTION,
-                0,
-            ),
-            "in_production": order_counts.get(
-                OrderStatus.IN_PRODUCTION,
-                0,
-            ),
-            "overdue_orders": overdue_orders,
-            "due_today": due_today,
-            "unpaid_invoices": invoice_counts.get(
-                InvoiceStatus.UNPAID,
-                0,
-            ),
-            "partially_paid_invoices": invoice_counts.get(
-                InvoiceStatus.PARTIALLY_PAID,
-                0,
-            ),
-            "paid_invoices": invoice_counts.get(
-                InvoiceStatus.PAID,
-                0,
-            ),
+            "today_orders": data.today_orders,
+            "today_payments": data.today_payments,
+            "outstanding": data.outstanding,
+            "new_customers": data.new_customers,
+            "received_orders": data.received_orders,
+            "reviewing_orders": data.reviewing_orders,
+            "ready_for_production": data.ready_for_production,
+            "in_production": data.in_production,
+            "overdue_orders": data.overdue_orders,
+            "due_today": data.due_today,
+            "unpaid_invoices": data.unpaid_invoices,
+            "partially_paid_invoices": data.partially_paid_invoices,
+            "paid_invoices": data.paid_invoices,
         }
 
     # ============================================================
@@ -589,112 +494,103 @@ class DashboardRepository:
         self,
         db: AsyncSession,
     ):
-        # --------------------------------------------------------
-        # TASK PIPELINE
-        # --------------------------------------------------------
+        now = now_ng()
 
-        task_counts_result = await db.execute(
-            select(
-                Task.status,
-                func.count(Task.id),
-            ).group_by(Task.status)
-        )
+        # ========================================================
+        # ONE DATABASE ROUND TRIP
+        # ========================================================
 
-        task_counts = {
-            task_status: count for task_status, count in task_counts_result.all()
-        }
-
-        design_queue = task_counts.get(TaskStatus.ASSIGNED, 0) + task_counts.get(
-            TaskStatus.IN_PROGRESS, 0
-        )
-
-        pending_reviews = task_counts.get(
-            TaskStatus.SUBMITTED,
-            0,
-        )
-
-        overdue = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.deadline < now_ng(),
-                    Task.status != TaskStatus.APPROVED,
-                )
+        query = select(
+            # ----------------------------------------------------
+            # TASK PIPELINE
+            # ----------------------------------------------------
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.ASSIGNED)
+            .scalar_subquery()
+            .label("assigned_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.IN_PROGRESS)
+            .scalar_subquery()
+            .label("in_progress_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.SUBMITTED)
+            .scalar_subquery()
+            .label("submitted_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.REVISION_REQUIRED)
+            .scalar_subquery()
+            .label("revision_required_tasks"),
+            select(func.count(Task.id))
+            .where(Task.status == TaskStatus.APPROVED)
+            .scalar_subquery()
+            .label("approved_tasks"),
+            select(func.count(Task.id))
+            .where(
+                Task.deadline < now,
+                Task.deadline.is_not(None),
+                Task.status != TaskStatus.APPROVED,
             )
-            or 0
+            .scalar_subquery()
+            .label("overdue_tasks"),
+            # ----------------------------------------------------
+            # PRODUCTION PIPELINE
+            # ----------------------------------------------------
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.CREATED)
+            .scalar_subquery()
+            .label("created"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.WAITING_FOR_REQUIREMENTS)
+            .scalar_subquery()
+            .label("waiting_for_requirements"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.READY_FOR_DESIGN)
+            .scalar_subquery()
+            .label("ready_for_design"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.IN_DESIGN)
+            .scalar_subquery()
+            .label("in_design"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.DESIGN_REVIEW)
+            .scalar_subquery()
+            .label("design_review"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.APPROVED_FOR_PRINT)
+            .scalar_subquery()
+            .label("approved_for_print"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.PRINTING)
+            .scalar_subquery()
+            .label("printing"),
+            select(func.count(ProductionFolder.id))
+            .where(ProductionFolder.status == ProductionStatus.COMPLETED)
+            .scalar_subquery()
+            .label("completed"),
         )
 
-        # --------------------------------------------------------
-        # PRODUCTION PIPELINE
-        # --------------------------------------------------------
+        result = await db.execute(query)
+        data = result.one()
 
-        production_counts_result = await db.execute(
-            select(
-                ProductionFolder.status,
-                func.count(ProductionFolder.id),
-            ).group_by(ProductionFolder.status)
-        )
-
-        production_counts = {
-            production_status: count
-            for production_status, count in production_counts_result.all()
-        }
+        design_queue = data.assigned_tasks + data.in_progress_tasks
 
         return {
             "design_queue": design_queue,
-            "pending_reviews": pending_reviews,
-            "overdue": overdue,
-            "assigned_tasks": task_counts.get(
-                TaskStatus.ASSIGNED,
-                0,
-            ),
-            "in_progress_tasks": task_counts.get(
-                TaskStatus.IN_PROGRESS,
-                0,
-            ),
-            "submitted_tasks": task_counts.get(
-                TaskStatus.SUBMITTED,
-                0,
-            ),
-            "revision_required_tasks": task_counts.get(
-                TaskStatus.REVISION_REQUIRED,
-                0,
-            ),
-            "approved_tasks": task_counts.get(
-                TaskStatus.APPROVED,
-                0,
-            ),
-            "created": production_counts.get(
-                ProductionStatus.CREATED,
-                0,
-            ),
-            "waiting_for_requirements": production_counts.get(
-                ProductionStatus.WAITING_FOR_REQUIREMENTS,
-                0,
-            ),
-            "ready_for_design": production_counts.get(
-                ProductionStatus.READY_FOR_DESIGN,
-                0,
-            ),
-            "in_design": production_counts.get(
-                ProductionStatus.IN_DESIGN,
-                0,
-            ),
-            "design_review": production_counts.get(
-                ProductionStatus.DESIGN_REVIEW,
-                0,
-            ),
-            "approved_for_print": production_counts.get(
-                ProductionStatus.APPROVED_FOR_PRINT,
-                0,
-            ),
-            "printing": production_counts.get(
-                ProductionStatus.PRINTING,
-                0,
-            ),
-            "completed": production_counts.get(
-                ProductionStatus.COMPLETED,
-                0,
-            ),
+            "pending_reviews": data.submitted_tasks,
+            "overdue": data.overdue_tasks,
+            "assigned_tasks": data.assigned_tasks,
+            "in_progress_tasks": data.in_progress_tasks,
+            "submitted_tasks": data.submitted_tasks,
+            "revision_required_tasks": (data.revision_required_tasks),
+            "approved_tasks": data.approved_tasks,
+            "created": data.created,
+            "waiting_for_requirements": (data.waiting_for_requirements),
+            "ready_for_design": data.ready_for_design,
+            "in_design": data.in_design,
+            "design_review": data.design_review,
+            "approved_for_print": data.approved_for_print,
+            "printing": data.printing,
+            "completed": data.completed,
         }
 
     # ============================================================
@@ -706,76 +602,181 @@ class DashboardRepository:
         db: AsyncSession,
         user_id: str,
     ):
-        # --------------------------------------------------------
-        # TASK COUNTS
-        # --------------------------------------------------------
+        now = now_ng()
 
-        assigned = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.assigned_to == user_id,
-                    Task.status == TaskStatus.ASSIGNED,
+        query = select(
+            func.count(
+                case(
+                    (
+                        Task.status == TaskStatus.ASSIGNED,
+                        1,
+                    )
                 )
-            )
-            or 0
-        )
+            ).label("assigned"),
+            func.count(
+                case(
+                    (
+                        Task.status == TaskStatus.IN_PROGRESS,
+                        1,
+                    )
+                )
+            ).label("in_progress"),
+            func.count(
+                case(
+                    (
+                        Task.status == TaskStatus.SUBMITTED,
+                        1,
+                    )
+                )
+            ).label("submitted"),
+            func.count(
+                case(
+                    (
+                        Task.status == TaskStatus.REVISION_REQUIRED,
+                        1,
+                    )
+                )
+            ).label("revision"),
+            func.count(
+                case(
+                    (
+                        Task.status == TaskStatus.APPROVED,
+                        1,
+                    )
+                )
+            ).label("approved"),
+            func.count(
+                case(
+                    (
+                        (
+                            (Task.deadline < now)
+                            & Task.deadline.is_not(None)
+                            & (Task.status != TaskStatus.APPROVED)
+                        ),
+                        1,
+                    )
+                )
+            ).label("overdue"),
+        ).where(Task.assigned_to == user_id)
 
-        in_progress = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.assigned_to == user_id,
-                    Task.status == TaskStatus.IN_PROGRESS,
-                )
-            )
-            or 0
-        )
-
-        submitted = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.assigned_to == user_id,
-                    Task.status == TaskStatus.SUBMITTED,
-                )
-            )
-            or 0
-        )
-
-        revision = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.assigned_to == user_id,
-                    Task.status == TaskStatus.REVISION_REQUIRED,
-                )
-            )
-            or 0
-        )
-
-        approved = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.assigned_to == user_id,
-                    Task.status == TaskStatus.APPROVED,
-                )
-            )
-            or 0
-        )
-
-        overdue = (
-            await db.scalar(
-                select(func.count(Task.id)).where(
-                    Task.assigned_to == user_id,
-                    Task.deadline < now_ng(),
-                    Task.status != TaskStatus.APPROVED,
-                )
-            )
-            or 0
-        )
+        result = await db.execute(query)
+        summary = result.one()
 
         return {
-            "assigned": assigned,
-            "in_progress": in_progress,
-            "submitted": submitted,
-            "revision": revision,
-            "approved": approved,
-            "overdue": overdue,
+            "assigned": summary.assigned,
+            "in_progress": summary.in_progress,
+            "submitted": summary.submitted,
+            "revision": summary.revision,
+            "approved": summary.approved,
+            "overdue": summary.overdue,
         }
+
+    # ============================================================
+    # STAFF ACTIVITY
+    # ============================================================
+
+    async def staff_activity(
+        self,
+        db: AsyncSession,
+    ):
+        now = now_ng()
+        online_cutoff = now - timedelta(minutes=5)
+
+        # ========================================================
+        # STEP 1
+        # Get staff + current task in ONE database round trip.
+        #
+        # row_number() gives us only the newest active task
+        # for each designer.
+        # ========================================================
+
+        task_rank = (
+            func.row_number()
+            .over(
+                partition_by=Task.assigned_to,
+                order_by=Task.created_at.desc(),
+            )
+            .label("task_rank")
+        )
+
+        current_task_subquery = (
+            select(
+                Task.assigned_to.label("assigned_to"),
+                Task.title.label("task_title"),
+                Task.status.label("task_status"),
+                task_rank,
+            )
+            .where(
+                Task.status.in_(
+                    [
+                        TaskStatus.ASSIGNED,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.REVISION_REQUIRED,
+                        TaskStatus.SUBMITTED,
+                    ]
+                )
+            )
+            .subquery()
+        )
+
+        query = (
+            select(
+                User.id,
+                User.first_name,
+                User.last_name,
+                User.username,
+                User.role,
+                User.last_login_at,
+                User.last_activity_at,
+                current_task_subquery.c.task_title,
+                current_task_subquery.c.task_status,
+            )
+            .outerjoin(
+                current_task_subquery,
+                (User.id == current_task_subquery.c.assigned_to)
+                & (current_task_subquery.c.task_rank == 1),
+            )
+            .where(
+                User.role.in_(
+                    [
+                        UserRole.FRONT_DESK,
+                        UserRole.GRAPHIC_LEAD,
+                        UserRole.GRAPHIC_DESIGNER,
+                    ]
+                )
+            )
+            .order_by(
+                User.role,
+                User.first_name,
+                User.last_name,
+            )
+        )
+
+        result = await db.execute(query)
+        staff = result.all()
+
+        # ========================================================
+        # BUILD RESPONSE
+        # ========================================================
+
+        output = []
+
+        for user in staff:
+            output.append(
+                {
+                    "id": str(user.id),
+                    "name": (f"{user.first_name} {user.last_name}"),
+                    "username": user.username,
+                    "role": user.role,
+                    "is_online": (
+                        user.last_activity_at is not None
+                        and user.last_activity_at >= online_cutoff
+                    ),
+                    "last_login": user.last_login_at,
+                    "last_activity": (user.last_activity_at),
+                    "current_task": user.task_title,
+                    "task_status": user.task_status,
+                }
+            )
+
+        return output

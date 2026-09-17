@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.customers.models import Customer
@@ -16,6 +16,7 @@ class CustomerRepository:
         customer: Customer,
     ) -> Customer:
         db.add(customer)
+
         await db.commit()
         await db.refresh(customer)
 
@@ -67,7 +68,10 @@ class CustomerRepository:
             .limit(limit)
         )
 
-        return list(result.scalars()), total
+        return (
+            list(result.scalars().all()),
+            total or 0,
+        )
 
     async def get_orders(
         self,
@@ -92,16 +96,12 @@ class CustomerRepository:
         for order, invoice in result.all():
             if invoice:
                 total_amount = Decimal(invoice.total_amount or 0)
-
                 amount_paid = Decimal(invoice.amount_paid or 0)
-
                 balance = Decimal(invoice.balance_due or 0)
 
             else:
                 total_amount = Decimal(order.total_amount or 0)
-
                 amount_paid = Decimal("0.00")
-
                 balance = total_amount
 
             orders.append(
@@ -126,10 +126,50 @@ class CustomerRepository:
         db: AsyncSession,
         customer_id: str,
     ):
+        # For orders with an invoice, use invoice values.
+        #
+        # For orders without an invoice, use the order total
+        # and assume nothing has been paid.
+
+        total_amount_expr = case(
+            (
+                Invoice.id.is_not(None),
+                Invoice.total_amount,
+            ),
+            else_=Order.total_amount,
+        )
+
+        amount_paid_expr = case(
+            (
+                Invoice.id.is_not(None),
+                Invoice.amount_paid,
+            ),
+            else_=Decimal("0.00"),
+        )
+
+        balance_expr = case(
+            (
+                Invoice.id.is_not(None),
+                Invoice.balance_due,
+            ),
+            else_=Order.total_amount,
+        )
+
         result = await db.execute(
             select(
-                Order,
-                Invoice,
+                func.count(Order.id).label("total_orders"),
+                func.coalesce(
+                    func.sum(total_amount_expr),
+                    0,
+                ).label("total_amount"),
+                func.coalesce(
+                    func.sum(amount_paid_expr),
+                    0,
+                ).label("amount_paid"),
+                func.coalesce(
+                    func.sum(balance_expr),
+                    0,
+                ).label("balance"),
             )
             .outerjoin(
                 Invoice,
@@ -138,49 +178,29 @@ class CustomerRepository:
             .where(Order.customer_id == customer_id)
         )
 
-        rows = result.all()
+        row = result.one()
 
-        total_orders = len(rows)
-
-        total_amount = Decimal("0.00")
-        amount_paid = Decimal("0.00")
-        balance = Decimal("0.00")
-
-        for order, invoice in rows:
-            if invoice:
-                order_total = Decimal(invoice.total_amount or 0)
-
-                order_paid = Decimal(invoice.amount_paid or 0)
-
-                order_balance = Decimal(invoice.balance_due or 0)
-
-            else:
-                order_total = Decimal(order.total_amount or 0)
-
-                order_paid = Decimal("0.00")
-
-                order_balance = order_total
-
-            total_amount += order_total
-            amount_paid += order_paid
-            balance += order_balance
+        total_orders = row.total_orders or 0
+        total_amount = Decimal(row.total_amount or 0)
+        amount_paid = Decimal(row.amount_paid or 0)
+        balance = Decimal(row.balance or 0)
 
         if total_amount <= 0:
-            status = "UNPAID"
+            payment_status = "UNPAID"
 
         elif balance <= 0:
-            status = "PAID"
+            payment_status = "PAID"
 
         elif amount_paid <= 0:
-            status = "UNPAID"
+            payment_status = "UNPAID"
 
         else:
-            status = "PARTIALLY_PAID"
+            payment_status = "PARTIALLY_PAID"
 
         return {
             "total_orders": total_orders,
             "total_amount": total_amount,
             "amount_paid": amount_paid,
             "balance": balance,
-            "status": status,
+            "status": payment_status,
         }

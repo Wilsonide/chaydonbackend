@@ -13,6 +13,7 @@ from app.core.security import (
     verify_password,
 )
 from app.domains.auth.models import RefreshSession
+from app.domains.dashboard.repository import now_ng
 from app.domains.users.credential_model import UserCredential
 from app.domains.users.models import User
 from app.domains.users.repository import UserRepository
@@ -152,19 +153,29 @@ class AuthService:
         if not password_valid:
             return None
 
-        # Create short-lived access token
+        # --------------------------------------------
+        # Update user presence
+        # --------------------------------------------
+
+        current_time = now_ng()
+
+        user.last_login_at = current_time
+        user.last_activity_at = current_time
+        user.is_online = True
+
+        # --------------------------------------------
+        # Create tokens
+        # --------------------------------------------
+
         access_token = create_access_token(str(user.id))
 
-        # Create refresh token + unique session ID
         refresh_token, jti = create_refresh_token(str(user.id))
 
-        # Calculate refresh-session expiration
+        # Refresh-session expiration stays in UTC
         expires_at = datetime.now(UTC) + timedelta(
             days=settings.REFRESH_TOKEN_EXPIRE_DAYS
         )
 
-        # Store ONLY the jti in the database.
-        # Never store the raw refresh JWT.
         refresh_session = RefreshSession(
             user_id=user.id,
             jti=jti,

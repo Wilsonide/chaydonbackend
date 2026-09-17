@@ -14,6 +14,7 @@ from app.domains.production.router import router as production_router
 from app.domains.tasks.router import router as tasks_router
 from app.domains.users.credential_router import router as credential_router
 from app.domains.users.router import router as users_router
+from app.middleware.activity import ActivityMiddleware
 
 # 1. Move the app instance outside of any function
 app = FastAPI(title="PrintFlow API", version="1.0.0")
@@ -27,6 +28,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(ActivityMiddleware)
 
 
 app.include_router(auth_router)

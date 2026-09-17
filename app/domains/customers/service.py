@@ -100,10 +100,21 @@ class CustomerService:
         db: AsyncSession,
         customer_id: str,
     ):
-        await self.get_by_id(
+        # The repository query itself determines whether
+        # the customer has orders.
+        #
+        # We still need to distinguish a valid customer
+        # with zero orders from a nonexistent customer.
+        customer = await self.repo.get_by_id(
             db,
             customer_id,
         )
+
+        if not customer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Customer not found",
+            )
 
         return await self.repo.get_orders(
             db,
@@ -115,10 +126,16 @@ class CustomerService:
         db: AsyncSession,
         customer_id: str,
     ):
-        await self.get_by_id(
+        customer = await self.repo.get_by_id(
             db,
             customer_id,
         )
+
+        if not customer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Customer not found",
+            )
 
         balance = await self.repo.get_balance(
             db,

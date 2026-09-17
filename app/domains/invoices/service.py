@@ -27,26 +27,17 @@ class InvoiceService:
         db: AsyncSession,
         data: InvoiceCreate,
     ) -> Invoice:
-        order = await self.order_repo.get_by_id(
+        # Lightweight existence check.
+        # We do not need the full Order object here.
+        order_exists = await self.order_repo.exists(
             db,
             data.order_id,
         )
 
-        if not order:
+        if not order_exists:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Order not found",
-            )
-
-        existing = await self.repo.get_by_order_id(
-            db,
-            data.order_id,
-        )
-
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Invoice already exists for this order",
             )
 
         total_amount = data.subtotal - data.discount + data.tax

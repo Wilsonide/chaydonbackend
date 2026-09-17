@@ -37,13 +37,12 @@ class ProductionService:
         # --------------------------------------------------------
         # Verify order exists
         # --------------------------------------------------------
-
-        order = await self.order_repo.get_by_id(
+        order_exists = await self.order_repo.exists(
             db,
             data.order_id,
         )
 
-        if not order:
+        if not order_exists:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Order not found",
@@ -52,7 +51,6 @@ class ProductionService:
         # --------------------------------------------------------
         # Make sure order does not already have a production folder
         # --------------------------------------------------------
-
         existing = await self.repo.get_by_order_id(
             db,
             data.order_id,
@@ -61,7 +59,7 @@ class ProductionService:
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Production folder already exists for this order",
+                detail=("Production folder already exists for this order"),
             )
 
         try:
@@ -77,8 +75,7 @@ class ProductionService:
 
             db.add(folder)
 
-            # Flush so the folder identity and generated values
-            # are available before creating related records.
+            # Flush so generated folder values are available.
             await db.flush()
 
             # ====================================================
@@ -106,8 +103,10 @@ class ProductionService:
                 user_id=user_id,
                 action="FOLDER_CREATED",
                 description=(
-                    f"Production folder {folder.folder_number} "
-                    f"was created with an initial design task."
+                    f"Production folder "
+                    f"{folder.folder_number} "
+                    f"was created with an initial "
+                    f"design task."
                 ),
             )
 
@@ -135,7 +134,7 @@ class ProductionService:
         if not created_folder:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Production folder could not be loaded after creation",
+                detail=("Production folder could not be loaded after creation"),
             )
 
         return created_folder
@@ -201,14 +200,7 @@ class ProductionService:
             return folder
 
         # --------------------------------------------------------
-        # Save folder changes
-        # --------------------------------------------------------
-
-        await db.commit()
-        await db.refresh(folder)
-
-        # --------------------------------------------------------
-        # Record activity
+        # Record activity in the SAME transaction
         # --------------------------------------------------------
 
         activity = ProductionActivity(
@@ -218,10 +210,13 @@ class ProductionService:
             description="; ".join(changes),
         )
 
-        await self.repo.add_activity(
-            db,
-            activity,
-        )
+        db.add(activity)
+
+        # --------------------------------------------------------
+        # Commit folder + activity together
+        # --------------------------------------------------------
+
+        await db.commit()
 
         # --------------------------------------------------------
         # Reload complete folder
@@ -300,10 +295,11 @@ class ProductionService:
         user_id: str,
     ):
         # --------------------------------------------------------
-        # Find production folder
+        # Only load the folder itself.
+        # We do NOT need files, activities, or tasks here.
         # --------------------------------------------------------
 
-        folder = await self.repo.get_by_id(
+        folder = await self.repo.get_basic_by_id(
             db,
             folder_id,
         )
@@ -399,10 +395,11 @@ class ProductionService:
         folder_id = production_file.production_folder_id
 
         # --------------------------------------------------------
-        # Find production folder
+        # Only load folder metadata.
+        # We do NOT need files, activities, or tasks.
         # --------------------------------------------------------
 
-        folder = await self.repo.get_by_id(
+        folder = await self.repo.get_basic_by_id(
             db,
             folder_id,
         )
@@ -447,4 +444,4 @@ class ProductionService:
                 activity,
             )
 
-        return {"message": "Production file deleted successfully"}
+        return {"message": ("Production file deleted successfully")}

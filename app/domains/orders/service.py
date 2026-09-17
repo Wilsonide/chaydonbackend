@@ -20,8 +20,11 @@ class OrderService:
         self.repo = OrderRepository()
         self.customer_repo = CustomerRepository()
         self.invoice_repo = InvoiceRepository()
-
         self.cloudinary = CloudinaryService()
+
+    # ============================================================
+    # CREATE ORDER
+    # ============================================================
 
     async def create(
         self,
@@ -68,10 +71,15 @@ class OrderService:
 
         await db.commit()
 
+        # Keep the relationship-loaded response.
         return await self.repo.get_by_id(
             db,
             str(order.id),
         )
+
+    # ============================================================
+    # GET ALL ORDERS
+    # ============================================================
 
     async def get_all(
         self,
@@ -95,6 +103,10 @@ class OrderService:
             limit=pagination.limit,
         )
 
+    # ============================================================
+    # GET ORDER BY ID
+    # ============================================================
+
     async def get_by_id(
         self,
         db: AsyncSession,
@@ -112,6 +124,10 @@ class OrderService:
             )
 
         return order
+
+    # ============================================================
+    # UPDATE ORDER
+    # ============================================================
 
     async def update(
         self,
@@ -136,6 +152,10 @@ class OrderService:
         if data.due_date is not None:
             order.due_date = data.due_date
 
+        # --------------------------------------------------------
+        # UPDATE ORDER TOTAL + INVOICE
+        # --------------------------------------------------------
+
         if data.total_amount is not None:
             invoice = await self.invoice_repo.get_by_order_id(
                 db,
@@ -159,7 +179,10 @@ class OrderService:
                 invoice.total_amount = data.total_amount
                 invoice.balance_due = data.total_amount - invoice.amount_paid
 
-                if data.total_amount in (0, invoice.amount_paid):
+                if data.total_amount in (
+                    0,
+                    invoice.amount_paid,
+                ):
                     invoice.status = InvoiceStatus.PAID
 
                 elif invoice.amount_paid > 0:
@@ -175,6 +198,10 @@ class OrderService:
             db,
             order,
         )
+
+    # ============================================================
+    # UPLOAD ORDER FILE
+    # ============================================================
 
     async def upload_file(
         self,
@@ -208,20 +235,36 @@ class OrderService:
             order_file,
         )
 
+    # ============================================================
+    # GET ORDER FILES
+    # ============================================================
+
     async def get_files(
         self,
         db: AsyncSession,
         order_id: str,
     ):
-        await self.get_by_id(
+        # Lightweight existence check instead of loading
+        # the complete order with customer + files.
+        exists = await self.repo.exists(
             db,
             order_id,
         )
+
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Order not found",
+            )
 
         return await self.repo.get_files(
             db,
             order_id,
         )
+
+    # ============================================================
+    # DELETE ORDER FILE
+    # ============================================================
 
     async def delete_file(
         self,
@@ -263,24 +306,28 @@ class OrderService:
             "message": "File deleted successfully",
         }
 
+    # ============================================================
+    # DELETE ORDER
+    # ============================================================
+
     async def delete(
         self,
         db: AsyncSession,
         order_id: str,
     ):
+        # We need the files here because they must also
+        # be removed from Cloudinary before deleting the order.
         order = await self.get_by_id(
             db,
             order_id,
         )
 
-        # Delete all Cloudinary files belonging to the order
         for file in order.files:
             await self.cloudinary.delete(
                 public_id=file.public_id,
                 resource_type=file.resource_type,
             )
 
-        # Delete the order and its database files
         await self.repo.delete(
             db,
             order,

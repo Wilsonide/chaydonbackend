@@ -66,7 +66,7 @@ class PaymentService:
         if not invoice:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invoice has not been created for this order.",
+                detail=("Invoice has not been created for this order."),
             )
 
         # --------------------------------------------------------
@@ -111,10 +111,9 @@ class PaymentService:
             method=data.method,
             reference=data.reference,
             notes=data.notes,
-            # Keep the foreign-key value.
             recorded_by=recorder.id,
-            # Explicitly attach the User relationship.
             recorder=recorder,
+            order=order,
         )
 
         await self.repo.create(
@@ -139,37 +138,21 @@ class PaymentService:
             invoice.status = InvoiceStatus.UNPAID
 
         # --------------------------------------------------------
-        # COMMIT
+        # COMMIT PAYMENT + INVOICE TOGETHER
         # --------------------------------------------------------
 
         await db.commit()
 
         # --------------------------------------------------------
-        # RELOAD PAYMENT WITH REQUIRED RELATIONSHIPS
+        # RETURN PAYMENT
         # --------------------------------------------------------
-
-        payment = await self.repo.get_by_id(
-            db,
-            payment.id,
-        )
-
-        if not payment:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=("Payment was created but could not be retrieved."),
-            )
-
+        #
+        # PaymentRepository.create() already flushed the payment,
+        # and the required relationships are attached above.
+        #
+        # expire_on_commit=False means the loaded objects remain
+        # available after commit.
         # --------------------------------------------------------
-        # SAFETY CHECK
-        # --------------------------------------------------------
-
-        if not payment.recorder:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=(
-                    "Payment was created, but the recording user could not be loaded."
-                ),
-            )
 
         return payment
 
@@ -182,12 +165,14 @@ class PaymentService:
         db: AsyncSession,
         order_id: str,
     ) -> list[Payment]:
-        order = await self.order_repo.get_by_id(
+        # Only verify that the order exists.
+        # We don't need to load the complete order.
+        order_exists = await self.order_repo.exists(
             db,
             order_id,
         )
 
-        if not order:
+        if not order_exists:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Order not found",
@@ -246,10 +231,14 @@ class PaymentService:
                 detail="Invoice not found",
             )
 
-        order = await self.order_repo.get_by_id(
-            db,
-            invoice.order_id,
-        )
+        # InvoiceRepository.get_by_id() already loads:
+        #
+        # invoice.order
+        # invoice.order.customer
+        #
+        # So there is no need for two additional queries.
+
+        order = invoice.order
 
         if not order:
             raise HTTPException(
@@ -257,10 +246,7 @@ class PaymentService:
                 detail="Order not found",
             )
 
-        customer = await self.customer_repo.get_by_id(
-            db,
-            order.customer_id,
-        )
+        customer = order.customer
 
         if not customer:
             raise HTTPException(

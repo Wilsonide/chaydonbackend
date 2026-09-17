@@ -9,8 +9,17 @@ from app.shared.search import ilike_search
 
 
 class InvoiceRepository:
-    async def create(self, db: AsyncSession, invoice: Invoice) -> Invoice:
+    # ============================================================
+    # CREATE INVOICE
+    # ============================================================
+
+    async def create(
+        self,
+        db: AsyncSession,
+        invoice: Invoice,
+    ) -> Invoice:
         db.add(invoice)
+
         await db.commit()
 
         result = await db.execute(
@@ -18,23 +27,46 @@ class InvoiceRepository:
             .options(selectinload(Invoice.order).selectinload(Order.customer))
             .where(Invoice.id == invoice.id)
         )
+
         return result.scalar_one()
 
-    async def get_by_id(self, db: AsyncSession, invoice_id: str):
+    # ============================================================
+    # GET INVOICE BY ID
+    # ============================================================
+
+    async def get_by_id(
+        self,
+        db: AsyncSession,
+        invoice_id: str,
+    ):
         result = await db.execute(
             select(Invoice)
             .options(selectinload(Invoice.order).selectinload(Order.customer))
             .where(Invoice.id == invoice_id)
         )
+
         return result.scalar_one_or_none()
 
-    async def get_by_order_id(self, db: AsyncSession, order_id: str):
+    # ============================================================
+    # GET INVOICE BY ORDER ID
+    # ============================================================
+
+    async def get_by_order_id(
+        self,
+        db: AsyncSession,
+        order_id: str,
+    ):
         result = await db.execute(
             select(Invoice)
             .options(selectinload(Invoice.order).selectinload(Order.customer))
             .where(Invoice.order_id == order_id)
         )
+
         return result.scalar_one_or_none()
+
+    # ============================================================
+    # GET ALL INVOICES
+    # ============================================================
 
     async def get_all(
         self,
@@ -44,43 +76,85 @@ class InvoiceRepository:
         limit: int,
         search: str | None = None,
     ):
-        query = select(Invoice).join(Invoice.order).join(Order.customer)
+        filters = []
 
         if search:
-            query = query.where(
+            filters.append(
                 or_(
-                    ilike_search(search, Customer.name),
-                    ilike_search(search, Order.title),
+                    ilike_search(
+                        search,
+                        Customer.name,
+                    ),
+                    ilike_search(
+                        search,
+                        Order.title,
+                    ),
                 )
             )
 
-        total = await db.scalar(select(func.count()).select_from(query.subquery()))
+        # --------------------------------------------------------
+        # TOTAL COUNT
+        # --------------------------------------------------------
 
-        result = await db.execute(
-            query.options(selectinload(Invoice.order).selectinload(Order.customer))
-            .order_by(Invoice.created_at.desc())
+        count_query = (
+            select(func.count(Invoice.id)).join(Invoice.order).join(Order.customer)
+        )
+
+        if filters:
+            count_query = count_query.where(*filters)
+
+        total = await db.scalar(count_query)
+
+        # --------------------------------------------------------
+        # PAGINATED DATA
+        # --------------------------------------------------------
+
+        query = (
+            select(Invoice)
+            .join(Invoice.order)
+            .join(Order.customer)
+            .options(selectinload(Invoice.order).selectinload(Order.customer))
+        )
+
+        if filters:
+            query = query.where(*filters)
+
+        query = (
+            query.order_by(Invoice.created_at.desc())
             .offset((page - 1) * limit)
             .limit(limit)
         )
 
-        return list(result.scalars().all()), total
+        result = await db.execute(query)
 
-    async def update(self, db: AsyncSession, invoice: Invoice):
+        invoices = list(result.scalars().all())
+
+        return invoices, total or 0
+
+    # ============================================================
+    # UPDATE INVOICE
+    # ============================================================
+
+    async def update(
+        self,
+        db: AsyncSession,
+        invoice: Invoice,
+    ):
         await db.commit()
+        await db.refresh(invoice)
 
-        result = await db.execute(
-            select(Invoice)
-            .options(selectinload(Invoice.order).selectinload(Order.customer))
-            .where(Invoice.id == invoice.id)
-        )
-        return result.scalar_one()
+        return invoice
 
-    async def update_payment_state(self, db: AsyncSession, invoice: Invoice):
+    # ============================================================
+    # UPDATE PAYMENT STATE
+    # ============================================================
+
+    async def update_payment_state(
+        self,
+        db: AsyncSession,
+        invoice: Invoice,
+    ):
         await db.commit()
+        await db.refresh(invoice)
 
-        result = await db.execute(
-            select(Invoice)
-            .options(selectinload(Invoice.order).selectinload(Order.customer))
-            .where(Invoice.id == invoice.id)
-        )
-        return result.scalar_one()
+        return invoice
