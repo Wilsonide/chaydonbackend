@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.domains.analytics.router import router as analytics_router
 from app.domains.auth.router import router as auth_router
 from app.domains.customers.router import router as customers_router
 from app.domains.dashboard.router import router as dashboard_router
@@ -45,6 +46,7 @@ app.include_router(
 app.include_router(inventory_router)
 app.include_router(users_router)
 app.include_router(credential_router)
+app.include_router(analytics_router)
 
 
 @app.get("/")

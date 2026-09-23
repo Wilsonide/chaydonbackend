@@ -1,18 +1,30 @@
+from typing import ClassVar
+
 from fastapi import HTTPException, UploadFile, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domains.orders.models import (
+    Order,
+    OrderStatus,
+)
 from app.domains.orders.repository import OrderRepository
 from app.domains.production.models import (
     ProductionActivity,
     ProductionFile,
     ProductionFolder,
+    ProductionStatus,
 )
 from app.domains.production.repository import ProductionRepository
 from app.domains.production.schemas import (
     ProductionCreate,
     ProductionUpdate,
 )
-from app.domains.tasks.models import Task, TaskPriority, TaskStatus
+from app.domains.tasks.models import (
+    Task,
+    TaskPriority,
+    TaskStatus,
+)
 from app.services.cloudinary_service import CloudinaryService
 from app.shared.responses import build_page
 
@@ -20,9 +32,181 @@ upload_service = CloudinaryService()
 
 
 class ProductionService:
+    # ============================================================
+    # PRODUCTION STATUS → ORDER STATUS
+    # ============================================================
+
+    PRODUCTION_TO_ORDER_STATUS: ClassVar[dict[ProductionStatus, OrderStatus]] = {
+        ProductionStatus.CREATED: OrderStatus.RECEIVED,
+        ProductionStatus.WAITING_FOR_REQUIREMENTS: OrderStatus.REVIEWING,
+        ProductionStatus.READY_FOR_DESIGN: OrderStatus.READY_FOR_PRODUCTION,
+        ProductionStatus.IN_DESIGN: OrderStatus.IN_PRODUCTION,
+        ProductionStatus.DESIGN_REVIEW: OrderStatus.IN_PRODUCTION,
+        ProductionStatus.APPROVED_FOR_PRINT: OrderStatus.IN_PRODUCTION,
+        ProductionStatus.PRINTING: OrderStatus.IN_PRODUCTION,
+        ProductionStatus.COMPLETED: OrderStatus.COMPLETED,
+        ProductionStatus.CANCELLED: OrderStatus.CANCELLED,
+    }
+
     def __init__(self):
         self.repo = ProductionRepository()
         self.order_repo = OrderRepository()
+
+    # ============================================================
+    # SYNCHRONIZE PRODUCTION FOLDER + ORDER
+    # ============================================================
+    #
+    # Workflow:
+    #
+    # Task
+    #   ↓
+    # Production Folder
+    #   ↓
+    # Order
+    #
+    # This method does NOT commit.
+    #
+    # The caller owns the transaction.
+    # ============================================================
+
+    async def _sync_workflow_status(
+        self,
+        db: AsyncSession,
+        folder: ProductionFolder,
+        actor_id: str,
+    ) -> None:
+        # --------------------------------------------------------
+        # LOAD ORDER
+        # --------------------------------------------------------
+
+        order = await db.get(
+            Order,
+            folder.order_id,
+        )
+
+        if not order:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Order not found for production folder",
+            )
+
+        # --------------------------------------------------------
+        # LOAD TASK STATUSES
+        # --------------------------------------------------------
+        #
+        # We query the database directly instead of relying on
+        # folder.tasks because the task may have just been created
+        # or modified in the current transaction.
+        # --------------------------------------------------------
+
+        result = await db.execute(
+            select(Task.status).where(Task.production_folder_id == folder.id)
+        )
+
+        task_statuses = list(result.scalars().all())
+
+        # --------------------------------------------------------
+        # DETERMINE TASK STATE
+        # --------------------------------------------------------
+
+        all_approved = bool(task_statuses) and all(
+            task_status == TaskStatus.APPROVED for task_status in task_statuses
+        )
+
+        any_review = any(
+            task_status
+            in {
+                TaskStatus.SUBMITTED,
+                TaskStatus.REVISION_REQUIRED,
+            }
+            for task_status in task_statuses
+        )
+
+        any_active = any(
+            task_status
+            in {
+                TaskStatus.ASSIGNED,
+                TaskStatus.IN_PROGRESS,
+            }
+            for task_status in task_statuses
+        )
+
+        # --------------------------------------------------------
+        # PRESERVE TERMINAL / PRINTING STATES
+        # --------------------------------------------------------
+        #
+        # Task synchronization controls the DESIGN phase.
+        #
+        # It must not accidentally move a folder backwards from:
+        #
+        # PRINTING
+        # COMPLETED
+        # CANCELLED
+        #
+        # just because a task was updated.
+        # --------------------------------------------------------
+
+        previous_folder_status = folder.status
+        previous_order_status = order.status
+
+        if folder.status in {
+            ProductionStatus.COMPLETED,
+            ProductionStatus.CANCELLED,
+            ProductionStatus.PRINTING,
+        }:
+            new_folder_status = folder.status
+
+        elif all_approved:
+            new_folder_status = ProductionStatus.APPROVED_FOR_PRINT
+
+        elif any_review:
+            new_folder_status = ProductionStatus.DESIGN_REVIEW
+
+        elif any_active:
+            new_folder_status = ProductionStatus.IN_DESIGN
+
+        else:
+            new_folder_status = ProductionStatus.READY_FOR_DESIGN
+
+        # --------------------------------------------------------
+        # UPDATE PRODUCTION FOLDER
+        # --------------------------------------------------------
+
+        folder.status = new_folder_status
+
+        # --------------------------------------------------------
+        # SYNCHRONIZE ORDER
+        # --------------------------------------------------------
+
+        new_order_status = self.PRODUCTION_TO_ORDER_STATUS.get(folder.status)
+
+        if new_order_status is not None:
+            order.status = new_order_status
+
+        # --------------------------------------------------------
+        # RECORD SYNCHRONIZATION ACTIVITY
+        # --------------------------------------------------------
+
+        if (
+            previous_folder_status != folder.status
+            or previous_order_status != order.status
+        ):
+            db.add(
+                ProductionActivity(
+                    production_folder_id=folder.id,
+                    user_id=actor_id,
+                    action="WORKFLOW_SYNCED",
+                    description=(
+                        "Workflow synchronized. "
+                        f"Production: "
+                        f"{previous_folder_status.value} → "
+                        f"{folder.status.value}; "
+                        f"Order: "
+                        f"{previous_order_status.value} → "
+                        f"{order.status.value}."
+                    ),
+                )
+            )
 
     # ============================================================
     # CREATE PRODUCTION FOLDER + INITIAL TASK
@@ -35,8 +219,9 @@ class ProductionService:
         user_id: str,
     ) -> ProductionFolder:
         # --------------------------------------------------------
-        # Verify order exists
+        # VERIFY ORDER EXISTS
         # --------------------------------------------------------
+
         order_exists = await self.order_repo.exists(
             db,
             data.order_id,
@@ -49,8 +234,9 @@ class ProductionService:
             )
 
         # --------------------------------------------------------
-        # Make sure order does not already have a production folder
+        # MAKE SURE ORDER DOES NOT ALREADY HAVE A FOLDER
         # --------------------------------------------------------
+
         existing = await self.repo.get_by_order_id(
             db,
             data.order_id,
@@ -75,7 +261,20 @@ class ProductionService:
 
             db.add(folder)
 
-            # Flush so generated folder values are available.
+            # ----------------------------------------------------
+            # FLUSH FOLDER
+            # ----------------------------------------------------
+            #
+            # This gives us:
+            #
+            # folder.id
+            # folder.production_number
+            # folder.created_at
+            # folder.folder_number
+            #
+            # before creating the task/activity.
+            # ----------------------------------------------------
+
             await db.flush()
 
             # ====================================================
@@ -94,23 +293,60 @@ class ProductionService:
 
             db.add(task)
 
+            # ----------------------------------------------------
+            # FLUSH TASK
+            # ----------------------------------------------------
+            #
+            # Important:
+            #
+            # The synchronization query must be able to see the
+            # newly created task in the current transaction.
+            # ----------------------------------------------------
+
+            await db.flush()
+
             # ====================================================
-            # RECORD PRODUCTION ACTIVITY
+            # RECORD FOLDER CREATION ACTIVITY
             # ====================================================
 
-            activity = ProductionActivity(
-                production_folder_id=folder.id,
-                user_id=user_id,
-                action="FOLDER_CREATED",
-                description=(
-                    f"Production folder "
-                    f"{folder.folder_number} "
-                    f"was created with an initial "
-                    f"design task."
-                ),
+            db.add(
+                ProductionActivity(
+                    production_folder_id=folder.id,
+                    user_id=user_id,
+                    action="FOLDER_CREATED",
+                    description=(
+                        f"Production folder "
+                        f"{folder.folder_number} "
+                        f"was created with an initial "
+                        f"design task."
+                    ),
+                )
             )
 
-            db.add(activity)
+            # ====================================================
+            # SYNCHRONIZE WORKFLOW
+            # ====================================================
+            #
+            # Initial task:
+            #
+            # UNASSIGNED
+            #
+            # Therefore:
+            #
+            # Production Folder:
+            # READY_FOR_DESIGN
+            #
+            # Order:
+            # READY_FOR_PRODUCTION
+            #
+            # Everything remains inside the same transaction.
+            # ====================================================
+
+            await self._sync_workflow_status(
+                db,
+                folder,
+                user_id,
+            )
 
             # ====================================================
             # COMMIT EVERYTHING TOGETHER
@@ -163,8 +399,10 @@ class ProductionService:
 
         changes: list[str] = []
 
+        old_folder_status = folder.status
+
         # --------------------------------------------------------
-        # Update title
+        # UPDATE TITLE
         # --------------------------------------------------------
 
         if data.title is not None and data.title != folder.title:
@@ -173,7 +411,7 @@ class ProductionService:
             folder.title = data.title
 
         # --------------------------------------------------------
-        # Update requirements
+        # UPDATE REQUIREMENTS
         # --------------------------------------------------------
 
         if data.requirements is not None and data.requirements != folder.requirements:
@@ -182,10 +420,12 @@ class ProductionService:
             folder.requirements = data.requirements
 
         # --------------------------------------------------------
-        # Update status
+        # UPDATE STATUS
         # --------------------------------------------------------
 
-        if data.status is not None and data.status != folder.status:
+        status_changed = data.status is not None and data.status != folder.status
+
+        if status_changed:
             changes.append(
                 f"status changed from {folder.status.value} to {data.status.value}"
             )
@@ -193,33 +433,67 @@ class ProductionService:
             folder.status = data.status
 
         # --------------------------------------------------------
-        # Nothing changed
+        # NOTHING CHANGED
         # --------------------------------------------------------
 
         if not changes:
             return folder
 
-        # --------------------------------------------------------
-        # Record activity in the SAME transaction
-        # --------------------------------------------------------
+        try:
+            # ----------------------------------------------------
+            # RECORD PRODUCTION ACTIVITY
+            # ----------------------------------------------------
 
-        activity = ProductionActivity(
-            production_folder_id=folder.id,
-            user_id=user_id,
-            action="FOLDER_UPDATED",
-            description="; ".join(changes),
-        )
+            db.add(
+                ProductionActivity(
+                    production_folder_id=folder.id,
+                    user_id=user_id,
+                    action="FOLDER_UPDATED",
+                    description="; ".join(changes),
+                )
+            )
 
-        db.add(activity)
+            # ----------------------------------------------------
+            # SYNCHRONIZE ORDER STATUS
+            # ----------------------------------------------------
+
+            if status_changed:
+                await self._sync_order_status(
+                    db,
+                    folder,
+                )
+
+                order_status = self.PRODUCTION_TO_ORDER_STATUS.get(folder.status)
+
+                if order_status is not None:
+                    db.add(
+                        ProductionActivity(
+                            production_folder_id=folder.id,
+                            user_id=user_id,
+                            action="ORDER_STATUS_SYNCED",
+                            description=(
+                                f"Order status synchronized "
+                                f"to {order_status.value} "
+                                f"because production folder "
+                                f"status changed from "
+                                f"{old_folder_status.value} "
+                                f"to {folder.status.value}."
+                            ),
+                        )
+                    )
+
+            # ----------------------------------------------------
+            # COMMIT EVERYTHING TOGETHER
+            # ----------------------------------------------------
+
+            await db.commit()
+
+        except Exception:
+            await db.rollback()
+            raise
 
         # --------------------------------------------------------
-        # Commit folder + activity together
-        # --------------------------------------------------------
-
-        await db.commit()
-
-        # --------------------------------------------------------
-        # Reload complete folder
+        # RELOAD COMPLETE PRODUCTION FOLDER
         # --------------------------------------------------------
 
         updated_folder = await self.repo.get_by_id(
@@ -295,8 +569,7 @@ class ProductionService:
         user_id: str,
     ):
         # --------------------------------------------------------
-        # Only load the folder itself.
-        # We do NOT need files, activities, or tasks here.
+        # LOAD FOLDER
         # --------------------------------------------------------
 
         folder = await self.repo.get_basic_by_id(
@@ -310,55 +583,86 @@ class ProductionService:
                 detail="Production folder not found",
             )
 
-        # --------------------------------------------------------
-        # Upload to Cloudinary
-        # --------------------------------------------------------
+        uploaded = None
 
-        uploaded = await upload_service.upload(
-            file,
-            f"printflow/production/{folder.folder_number}",
-        )
+        try:
+            # ----------------------------------------------------
+            # UPLOAD TO CLOUDINARY
+            # ----------------------------------------------------
 
-        # --------------------------------------------------------
-        # Save file metadata
-        # --------------------------------------------------------
+            uploaded = await upload_service.upload(
+                file,
+                f"printflow/production/{folder.folder_number}",
+            )
 
-        production_file = ProductionFile(
-            production_folder_id=folder.id,
-            file_name=uploaded["file_name"],
-            file_url=uploaded["url"],
-            public_id=uploaded["public_id"],
-            file_type=uploaded["file_type"],
-            resource_type=uploaded["resource_type"],
-            uploaded_by=user_id,
-        )
+            # ----------------------------------------------------
+            # SAVE FILE METADATA
+            # ----------------------------------------------------
 
-        await self.repo.add_file(
-            db,
-            production_file,
-        )
+            production_file = ProductionFile(
+                production_folder_id=folder.id,
+                file_name=uploaded["file_name"],
+                file_url=uploaded["url"],
+                public_id=uploaded["public_id"],
+                file_type=uploaded["file_type"],
+                resource_type=uploaded["resource_type"],
+                uploaded_by=user_id,
+            )
 
-        # --------------------------------------------------------
-        # Record activity
-        # --------------------------------------------------------
+            await self.repo.add_file(
+                db,
+                production_file,
+            )
 
-        activity = ProductionActivity(
-            production_folder_id=folder.id,
-            user_id=user_id,
-            action="FILE_UPLOADED",
-            description=(
-                f"{uploaded['file_name']} was uploaded "
-                f"to production folder "
-                f"{folder.folder_number}."
-            ),
-        )
+            # ----------------------------------------------------
+            # RECORD ACTIVITY
+            # ----------------------------------------------------
 
-        await self.repo.add_activity(
-            db,
-            activity,
-        )
+            activity = ProductionActivity(
+                production_folder_id=folder.id,
+                user_id=user_id,
+                action="FILE_UPLOADED",
+                description=(
+                    f"{uploaded['file_name']} was uploaded "
+                    f"to production folder "
+                    f"{folder.folder_number}."
+                ),
+            )
 
-        return production_file
+            await self.repo.add_activity(
+                db,
+                activity,
+            )
+
+            # ----------------------------------------------------
+            # COMMIT FILE + ACTIVITY TOGETHER
+            # ----------------------------------------------------
+
+            await db.commit()
+
+            # ----------------------------------------------------
+            # RETURN FILE
+            # ----------------------------------------------------
+
+            return production_file
+
+        except Exception:
+            await db.rollback()
+
+            # ----------------------------------------------------
+            # CLEAN UP CLOUDINARY IF DB OPERATION FAILED
+            # ----------------------------------------------------
+
+            if uploaded and uploaded.get("public_id"):
+                try:
+                    await upload_service.delete(
+                        uploaded["public_id"],
+                        uploaded.get("resource_type"),
+                    )
+                except Exception:
+                    pass
+
+            raise
 
     # ============================================================
     # DELETE PRODUCTION FILE
@@ -371,7 +675,7 @@ class ProductionService:
         user_id: str,
     ):
         # --------------------------------------------------------
-        # Find production file
+        # FIND PRODUCTION FILE
         # --------------------------------------------------------
 
         production_file = await self.repo.get_file(
@@ -386,7 +690,7 @@ class ProductionService:
             )
 
         # --------------------------------------------------------
-        # Store values before deleting DB object
+        # STORE VALUES BEFORE DELETE
         # --------------------------------------------------------
 
         file_name = production_file.file_name
@@ -395,8 +699,7 @@ class ProductionService:
         folder_id = production_file.production_folder_id
 
         # --------------------------------------------------------
-        # Only load folder metadata.
-        # We do NOT need files, activities, or tasks.
+        # LOAD FOLDER
         # --------------------------------------------------------
 
         folder = await self.repo.get_basic_by_id(
@@ -404,30 +707,36 @@ class ProductionService:
             folder_id,
         )
 
-        # --------------------------------------------------------
-        # Delete from Cloudinary
-        # --------------------------------------------------------
-
-        if public_id:
-            await upload_service.delete(
-                public_id,
-                resource_type,
+        if not folder:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Production folder not found",
             )
 
-        # --------------------------------------------------------
-        # Delete database record
-        # --------------------------------------------------------
+        try:
+            # ----------------------------------------------------
+            # DELETE FROM CLOUDINARY
+            # ----------------------------------------------------
 
-        await self.repo.delete_file(
-            db,
-            production_file,
-        )
+            if public_id:
+                await upload_service.delete(
+                    public_id,
+                    resource_type,
+                )
 
-        # --------------------------------------------------------
-        # Record activity
-        # --------------------------------------------------------
+            # ----------------------------------------------------
+            # DELETE DATABASE RECORD
+            # ----------------------------------------------------
 
-        if folder:
+            await self.repo.delete_file(
+                db,
+                production_file,
+            )
+
+            # ----------------------------------------------------
+            # RECORD ACTIVITY
+            # ----------------------------------------------------
+
             activity = ProductionActivity(
                 production_folder_id=folder.id,
                 user_id=user_id,
@@ -444,4 +753,46 @@ class ProductionService:
                 activity,
             )
 
-        return {"message": ("Production file deleted successfully")}
+            # ----------------------------------------------------
+            # COMMIT DELETE + ACTIVITY
+            # ----------------------------------------------------
+
+            await db.commit()
+            return {"message": ("Production file deleted successfully")}
+
+        except Exception:
+            await db.rollback()
+            raise
+
+    # ============================================================
+    # SYNCHRONIZE ORDER STATUS
+    # ============================================================
+
+    async def _sync_order_status(
+        self,
+        db: AsyncSession,
+        folder: ProductionFolder,
+    ) -> None:
+        # --------------------------------------------------------
+        # LOAD ORDER
+        # --------------------------------------------------------
+
+        order = await db.get(
+            Order,
+            folder.order_id,
+        )
+
+        if not order:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=("Order not found for production folder"),
+            )
+
+        # --------------------------------------------------------
+        # DETERMINE ORDER STATUS
+        # --------------------------------------------------------
+
+        new_order_status = self.PRODUCTION_TO_ORDER_STATUS.get(folder.status)
+
+        if new_order_status is not None:
+            order.status = new_order_status

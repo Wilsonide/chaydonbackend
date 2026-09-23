@@ -2,6 +2,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.domains.orders.models import Order
+from app.domains.production.models import ProductionFolder
 from app.domains.tasks.models import (
     Task,
     TaskComment,
@@ -29,6 +31,7 @@ class TaskRepository:
         search: str | None = None,
         status: str | None = None,
         priority: str | None = None,
+        order_type=None,
     ):
         filters = []
 
@@ -38,7 +41,6 @@ class TaskRepository:
                 Task.title,
                 Task.description,
             )
-
             if search_filter is not None:
                 filters.append(search_filter)
 
@@ -47,6 +49,9 @@ class TaskRepository:
 
         if priority:
             filters.append(Task.priority == priority)
+
+        if order_type:
+            filters.append(Order.order_type == order_type)
 
         return filters
 
@@ -162,21 +167,44 @@ class TaskRepository:
         search: str | None = None,
         status: str | None = None,
         priority: str | None = None,
+        order_type=None,
     ):
         filters = self._build_task_filters(
             search=search,
             status=status,
             priority=priority,
+            order_type=order_type,
         )
 
-        count_query = select(func.count(Task.id))
+        count_query = (
+            select(func.count(Task.id))
+            .join(
+                ProductionFolder,
+                Task.production_folder_id == ProductionFolder.id,
+            )
+            .join(
+                Order,
+                ProductionFolder.order_id == Order.id,
+            )
+        )
 
         if filters:
             count_query = count_query.where(*filters)
 
         total = await db.scalar(count_query)
 
-        query = select(Task).options(*self._task_load_options())
+        query = (
+            select(Task)
+            .join(
+                ProductionFolder,
+                Task.production_folder_id == ProductionFolder.id,
+            )
+            .join(
+                Order,
+                ProductionFolder.order_id == Order.id,
+            )
+            .options(*self._task_load_options())
+        )
 
         if filters:
             query = query.where(*filters)
@@ -189,7 +217,7 @@ class TaskRepository:
 
         result = await db.execute(query)
 
-        tasks = list(result.scalars().all())
+        tasks = list(result.scalars().unique().all())
 
         return tasks, total or 0
 

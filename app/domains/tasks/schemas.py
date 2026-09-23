@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -138,7 +139,6 @@ class TaskResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-
     production_folder_id: UUID
     assigned_by: UUID
     assigned_to: UUID | None
@@ -153,11 +153,11 @@ class TaskResponse(BaseModel):
 
     title: str
     description: str | None
-
     priority: TaskPriority
     status: TaskStatus
-
     deadline: datetime | None
+
+    designer_charge: Decimal
 
     created_at: datetime
 
@@ -170,6 +170,11 @@ class TaskResponse(BaseModel):
 class TaskReview(BaseModel):
     approve: bool
     message: str | None = None
+    designer_charge: Decimal = Field(
+        default=Decimal("0.00"),
+        ge=0,
+        decimal_places=2,
+    )
 
 
 # ============================================================

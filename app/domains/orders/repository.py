@@ -2,7 +2,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.domains.orders.models import Order, OrderFile
+from app.domains.orders.models import (
+    Order,
+    OrderFile,
+    OrderType,
+)
 from app.shared.search import ilike_search
 
 
@@ -17,19 +21,8 @@ class OrderRepository:
         order: Order,
     ) -> Order:
         db.add(order)
-
-        await db.commit()
-
-        result = await db.execute(
-            select(Order)
-            .options(
-                selectinload(Order.files),
-                selectinload(Order.customer),
-            )
-            .where(Order.id == order.id)
-        )
-
-        return result.scalar_one()
+        await db.flush()
+        return order
 
     # ============================================================
     # UPDATE ORDER
@@ -40,9 +33,7 @@ class OrderRepository:
         db: AsyncSession,
         order: Order,
     ) -> Order:
-        await db.commit()
-        await db.refresh(order)
-
+        await db.flush()
         return order
 
     # ============================================================
@@ -77,22 +68,39 @@ class OrderRepository:
         limit: int,
         search: str | None = None,
         status=None,
+        order_type: OrderType | None = None,
     ):
         filters = []
 
+        # --------------------------------------------------------
+        # SEARCH
+        # --------------------------------------------------------
+
         if search:
-            filters.append(
-                ilike_search(
-                    search,
-                    Order.title,
-                )
+            search_filter = ilike_search(
+                search,
+                Order.title,
             )
+
+            if search_filter is not None:
+                filters.append(search_filter)
+
+        # --------------------------------------------------------
+        # STATUS FILTER
+        # --------------------------------------------------------
 
         if status:
             filters.append(Order.status == status)
 
         # --------------------------------------------------------
-        # TOTAL COUNT
+        # ORDER TYPE FILTER
+        # --------------------------------------------------------
+
+        if order_type:
+            filters.append(Order.order_type == order_type)
+
+        # --------------------------------------------------------
+        # COUNT
         # --------------------------------------------------------
 
         count_query = select(func.count(Order.id))
@@ -103,7 +111,7 @@ class OrderRepository:
         total = await db.scalar(count_query)
 
         # --------------------------------------------------------
-        # PAGINATED DATA
+        # ORDERS
         # --------------------------------------------------------
 
         query = select(Order).options(
@@ -136,10 +144,7 @@ class OrderRepository:
         file: OrderFile,
     ):
         db.add(file)
-
-        await db.commit()
-        await db.refresh(file)
-
+        await db.flush()
         return file
 
     # ============================================================
@@ -182,7 +187,7 @@ class OrderRepository:
         file: OrderFile,
     ):
         await db.delete(file)
-        await db.commit()
+        await db.flush()
 
     # ============================================================
     # DELETE ORDER
@@ -194,7 +199,7 @@ class OrderRepository:
         order: Order,
     ):
         await db.delete(order)
-        await db.commit()
+        await db.flush()
 
     # ============================================================
     # CHECK ORDER EXISTS

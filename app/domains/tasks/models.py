@@ -1,7 +1,8 @@
 import enum
 import uuid
+from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDMixin
@@ -50,6 +51,11 @@ class Task(UUIDMixin, TimestampMixin, Base):
         ),
         nullable=True,
         index=True,
+    )
+    designer_charge: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+        default=Decimal("0.00"),
     )
 
     title: Mapped[str] = mapped_column(

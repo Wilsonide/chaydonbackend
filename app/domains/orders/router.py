@@ -7,7 +7,10 @@ from app.db.dependencies import get_db
 from app.domains.auth.permissions import (
     RequireSuperAdminOrFrontDesk,
 )
-from app.domains.orders.models import OrderStatus
+from app.domains.orders.models import (
+    OrderStatus,
+    OrderType,
+)
 from app.domains.orders.schemas import (
     OrderCreate,
     OrderFileResponse,
@@ -64,12 +67,14 @@ async def get_orders(
     pagination: Pagination,
     search: str | None = None,
     status: OrderStatus | None = None,
+    order_type: OrderType | None = None,
 ):
     return await service.get_all(
         db,
         pagination,
         search,
         status,
+        order_type,
     )
 
 

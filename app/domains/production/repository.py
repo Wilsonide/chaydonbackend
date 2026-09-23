@@ -49,15 +49,6 @@ class ProductionRepository:
     # ============================================================
     # GET PRODUCTION FOLDER METADATA
     # ============================================================
-    #
-    # Used when the service only needs folder information such as:
-    # - id
-    # - production_number
-    # - created_at
-    # - folder_number
-    #
-    # This avoids loading files, activities, and tasks.
-    # ============================================================
 
     async def get_basic_by_id(
         self,
@@ -105,16 +96,17 @@ class ProductionRepository:
         filters = []
 
         if search:
-            filters.append(
-                ilike_search(
-                    search,
-                    ProductionFolder.title,
-                    cast(
-                        ProductionFolder.production_number,
-                        String,
-                    ),
-                )
+            search_filter = ilike_search(
+                search,
+                ProductionFolder.title,
+                cast(
+                    ProductionFolder.production_number,
+                    String,
+                ),
             )
+
+            if search_filter is not None:
+                filters.append(search_filter)
 
         if status:
             filters.append(ProductionFolder.status == status)
@@ -165,7 +157,6 @@ class ProductionRepository:
         activity: ProductionActivity,
     ) -> ProductionActivity:
         db.add(activity)
-
         await db.flush()
 
         return activity
@@ -180,9 +171,7 @@ class ProductionRepository:
         file: ProductionFile,
     ) -> ProductionFile:
         db.add(file)
-
-        await db.commit()
-        await db.refresh(file)
+        await db.flush()
 
         return file
 
@@ -194,7 +183,7 @@ class ProductionRepository:
         self,
         db: AsyncSession,
         file_id: str,
-    ):
+    ) -> ProductionFile | None:
         result = await db.execute(
             select(ProductionFile).where(ProductionFile.id == file_id)
         )
@@ -209,6 +198,6 @@ class ProductionRepository:
         self,
         db: AsyncSession,
         production_file: ProductionFile,
-    ):
+    ) -> None:
         await db.delete(production_file)
-        await db.commit()
+        await db.flush()

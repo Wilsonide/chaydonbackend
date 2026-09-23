@@ -20,6 +20,7 @@ from app.domains.auth.permissions import (
     RequireGraphicLead,
     RequireSuperAdminOrGraphicLead,
 )
+from app.domains.orders.models import OrderType
 from app.domains.tasks.models import (
     TaskPriority,
     TaskStatus,
@@ -78,37 +79,27 @@ async def create_task(
 # ============================================================
 
 
-@router.get(
-    "",
-    response_model=PaginatedResponse[TaskResponse],
-)
+@router.get("", response_model=PaginatedResponse[TaskResponse])
 async def get_all_tasks(
-    db: Annotated[
-        AsyncSession,
-        Depends(get_db),
-    ],
+    db: Annotated[AsyncSession, Depends(get_db)],
     _: Annotated[
         object,
         Depends(RequireSuperAdminOrGraphicLead),
     ],
     pagination: Pagination,
-    search: str | None = Query(
-        default=None,
-    ),
-    status: TaskStatus | None = Query(
-        default=None,
-    ),
-    priority: TaskPriority | None = Query(
-        default=None,
-    ),
+    search: str | None = Query(default=None),
+    status: TaskStatus | None = Query(default=None),
+    priority: TaskPriority | None = Query(default=None),
+    order_type: Annotated[OrderType | None, Query()] = None,
 ):
     return await service.get_all(
-        db=db,
+        db,
         page=pagination.page,
         limit=pagination.limit,
         search=search,
         status=status,
         priority=priority,
+        order_type=order_type,
     )
 
 
@@ -342,6 +333,7 @@ async def review_task(
         str(current_user.id),
         data.approve,
         data.message,
+        data.designer_charge,
     )
 
 
