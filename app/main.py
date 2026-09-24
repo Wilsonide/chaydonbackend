@@ -25,6 +25,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://chaydonfronted.vercel.app",
+        "https://www.chaydonmedia.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
