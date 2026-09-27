@@ -40,7 +40,7 @@ async def create_order(
         AsyncSession,
         Depends(get_db),
     ],
-    _: Annotated[
+    current_user: Annotated[
         User,
         Depends(RequireSuperAdminOrFrontDesk),
     ],
@@ -48,6 +48,7 @@ async def create_order(
     return await service.create(
         db,
         data,
+        current_user,
     )
 
 
@@ -155,7 +156,7 @@ async def update_order(
         AsyncSession,
         Depends(get_db),
     ],
-    _: Annotated[
+    current_user: Annotated[
         User,
         Depends(RequireSuperAdminOrFrontDesk),
     ],
@@ -164,6 +165,7 @@ async def update_order(
         db,
         order_id,
         data,
+        current_user,
     )
 
 

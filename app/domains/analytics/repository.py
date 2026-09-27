@@ -1,14 +1,12 @@
 from calendar import month_name
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import extract, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domains.inventory.models import MovementType, StockMovement
-from app.domains.orders.models import Order, OrderStatus, OrderType
-from app.domains.production.models import ProductionFolder
-from app.domains.tasks.models import Task, TaskStatus
-from app.domains.users.models import User
+from app.domains.orders.models import Order, OrderStatus
 
 
 class AnalyticsRepository:
@@ -16,34 +14,33 @@ class AnalyticsRepository:
         self,
         db: AsyncSession,
         year: int,
-    ) -> list[dict]:
+    ) -> dict:
         """
-        Build monthly analytics based on completed orders.
+        Build yearly analytics with monthly and daily drill-down.
 
         Revenue:
             Order.total_amount
 
         Material cost:
-            Linked STOCK_OUT movements for each completed order.
-
-        Designer cost:
-            Charges recorded on approved design tasks belonging to
-            completed design orders.
+            Linked STOCK_OUT movements for completed orders.
 
         Profit:
-            Revenue - material cost - designer cost
+            Revenue - material cost
 
-        Inventory consumption and designer charges are attributed
-        to the month in which the related order was completed.
+        Inventory consumption is attributed to the
+        completion date of the related order.
         """
 
         # =========================================================
-        # 1. Revenue from completed orders
+        # 1. Monthly revenue
         # =========================================================
 
-        revenue_query = (
+        monthly_revenue_query = (
             select(
-                extract("month", Order.completed_at).label("month"),
+                extract(
+                    "month",
+                    Order.completed_at,
+                ).label("month"),
                 func.count(Order.id).label("orders"),
                 func.coalesce(
                     func.sum(Order.total_amount),
@@ -56,27 +53,33 @@ class AnalyticsRepository:
                 extract("year", Order.completed_at) == year,
             )
             .group_by(
-                extract("month", Order.completed_at),
+                extract(
+                    "month",
+                    Order.completed_at,
+                ),
             )
         )
 
-        revenue_result = await db.execute(revenue_query)
+        monthly_revenue_result = await db.execute(monthly_revenue_query)
 
-        revenue_rows = {
+        monthly_revenue_rows = {
             int(row.month): {
                 "orders": int(row.orders),
                 "revenue": Decimal(str(row.revenue or 0)),
             }
-            for row in revenue_result
+            for row in monthly_revenue_result
         }
 
         # =========================================================
-        # 2. Material cost for completed orders
+        # 2. Monthly inventory/material cost
         # =========================================================
 
-        inventory_query = (
+        monthly_inventory_query = (
             select(
-                extract("month", Order.completed_at).label("month"),
+                extract(
+                    "month",
+                    Order.completed_at,
+                ).label("month"),
                 func.coalesce(
                     func.sum(StockMovement.quantity),
                     0,
@@ -94,153 +97,150 @@ class AnalyticsRepository:
                 Order.status == OrderStatus.COMPLETED,
                 Order.completed_at.is_not(None),
                 StockMovement.movement_type == MovementType.STOCK_OUT,
-                extract("year", Order.completed_at) == year,
+                extract(
+                    "year",
+                    Order.completed_at,
+                )
+                == year,
             )
             .group_by(
-                extract("month", Order.completed_at),
+                extract(
+                    "month",
+                    Order.completed_at,
+                ),
             )
         )
 
-        inventory_result = await db.execute(inventory_query)
+        monthly_inventory_result = await db.execute(monthly_inventory_query)
 
-        inventory_rows = {
+        monthly_inventory_rows = {
             int(row.month): {
                 "units_used": int(row.units_used or 0),
                 "inventory_value": Decimal(str(row.inventory_value or 0)),
             }
-            for row in inventory_result
+            for row in monthly_inventory_result
         }
 
         # =========================================================
-        # 3. Designer cost for completed design orders
-        # =========================================================
-        #
-        # Task
-        #   -> ProductionFolder
-        #   -> Order
-        #
-        # Only APPROVED tasks are included.
-        #
-        # The charge is attributed to Order.completed_at.
-        #
+        # 3. Daily revenue
         # =========================================================
 
-        designer_cost_query = (
+        daily_revenue_query = (
             select(
                 extract(
                     "month",
                     Order.completed_at,
                 ).label("month"),
+                extract(
+                    "day",
+                    Order.completed_at,
+                ).label("day"),
+                func.count(Order.id).label("orders"),
                 func.coalesce(
-                    func.sum(Task.designer_charge),
+                    func.sum(Order.total_amount),
                     0,
-                ).label("designer_cost"),
-            )
-            .join(
-                ProductionFolder,
-                ProductionFolder.id == Task.production_folder_id,
-            )
-            .join(
-                Order,
-                Order.id == ProductionFolder.order_id,
+                ).label("revenue"),
             )
             .where(
-                Task.status == TaskStatus.APPROVED,
-                Task.designer_charge > 0,
                 Order.status == OrderStatus.COMPLETED,
-                Order.order_type == OrderType.DESIGN,
                 Order.completed_at.is_not(None),
                 extract("year", Order.completed_at) == year,
             )
             .group_by(
-                extract("month", Order.completed_at),
+                extract(
+                    "month",
+                    Order.completed_at,
+                ),
+                extract(
+                    "day",
+                    Order.completed_at,
+                ),
             )
         )
 
-        designer_cost_result = await db.execute(designer_cost_query)
+        daily_revenue_result = await db.execute(daily_revenue_query)
 
-        designer_cost_rows = {
-            int(row.month): Decimal(str(row.designer_cost or 0))
-            for row in designer_cost_result
+        daily_revenue_rows = {
+            (
+                int(row.month),
+                int(row.day),
+            ): {
+                "orders": int(row.orders),
+                "revenue": Decimal(str(row.revenue or 0)),
+            }
+            for row in daily_revenue_result
         }
 
         # =========================================================
-        # 4. Per-designer earnings
-        # =========================================================
-        #
-        # Each approved task contributes its designer_charge to the
-        # designer who was assigned to that task.
-        #
-        # assigned_to is used because approved tasks cannot be
-        # reassigned in the current workflow.
-        #
+        # 4. Daily inventory/material cost
         # =========================================================
 
-        designer_query = (
+        daily_inventory_query = (
             select(
-                Task.assigned_to.label("designer_id"),
-                func.concat(
-                    User.first_name,
-                    " ",
-                    User.last_name,
-                ).label("designer_name"),
+                extract(
+                    "month",
+                    Order.completed_at,
+                ).label("month"),
+                extract(
+                    "day",
+                    Order.completed_at,
+                ).label("day"),
                 func.coalesce(
-                    func.sum(Task.designer_charge),
+                    func.sum(StockMovement.quantity),
                     0,
-                ).label("total_charge"),
-                func.count(Task.id).label("completed_tasks"),
-            )
-            .join(
-                ProductionFolder,
-                ProductionFolder.id == Task.production_folder_id,
+                ).label("units_used"),
+                func.coalesce(
+                    func.sum(StockMovement.quantity * StockMovement.unit_selling_price),
+                    0,
+                ).label("inventory_value"),
             )
             .join(
                 Order,
-                Order.id == ProductionFolder.order_id,
-            )
-            .join(
-                User,
-                User.id == Task.assigned_to,
+                Order.id == StockMovement.order_id,
             )
             .where(
-                Task.status == TaskStatus.APPROVED,
-                Task.assigned_to.is_not(None),
-                Task.designer_charge > 0,
                 Order.status == OrderStatus.COMPLETED,
-                Order.order_type == OrderType.DESIGN,
                 Order.completed_at.is_not(None),
-                extract("year", Order.completed_at) == year,
+                StockMovement.movement_type == MovementType.STOCK_OUT,
+                extract(
+                    "year",
+                    Order.completed_at,
+                )
+                == year,
             )
             .group_by(
-                Task.assigned_to,
-                User.first_name,
-                User.last_name,
-            )
-            .order_by(
-                func.sum(Task.designer_charge).desc(),
+                extract(
+                    "month",
+                    Order.completed_at,
+                ),
+                extract(
+                    "day",
+                    Order.completed_at,
+                ),
             )
         )
 
-        designer_result = await db.execute(designer_query)
+        daily_inventory_result = await db.execute(daily_inventory_query)
 
-        designer_rows = [
-            {
-                "designer_id": row.designer_id,
-                "designer_name": row.designer_name,
-                "completed_tasks": int(row.completed_tasks or 0),
-                "total_charge": Decimal(str(row.total_charge or 0)),
+        daily_inventory_rows = {
+            (
+                int(row.month),
+                int(row.day),
+            ): {
+                "units_used": int(row.units_used or 0),
+                "inventory_value": Decimal(str(row.inventory_value or 0)),
             }
-            for row in designer_result
-        ]
+            for row in daily_inventory_result
+        }
 
         # =========================================================
-        # 5. Build all 12 months
+        # 5. Build monthly + daily structure
         # =========================================================
 
         monthly = []
 
         for month in range(1, 13):
-            revenue_data = revenue_rows.get(
+            monthly_revenue = monthly_revenue_rows.get(
                 month,
                 {
                     "orders": 0,
@@ -248,7 +248,7 @@ class AnalyticsRepository:
                 },
             )
 
-            inventory_data = inventory_rows.get(
+            monthly_inventory = monthly_inventory_rows.get(
                 month,
                 {
                     "units_used": 0,
@@ -256,32 +256,91 @@ class AnalyticsRepository:
                 },
             )
 
-            revenue = revenue_data["revenue"]
+            revenue = monthly_revenue["revenue"]
+            material_cost = monthly_inventory["inventory_value"]
 
-            material_cost = inventory_data["inventory_value"]
+            monthly_profit = revenue - material_cost
 
-            designer_cost = designer_cost_rows.get(
+            # -----------------------------------------------------
+            # Determine number of days in the month
+            # -----------------------------------------------------
+
+            if month == 12:
+                next_month = date(year + 1, 1, 1)
+            else:
+                next_month = date(year, month + 1, 1)
+
+            current_month = date(
+                year,
                 month,
-                Decimal("0.00"),
+                1,
             )
 
-            profit = revenue - material_cost - designer_cost
+            days_in_month = (next_month - current_month).days
+
+            # -----------------------------------------------------
+            # Build daily analytics
+            # -----------------------------------------------------
+
+            daily = []
+
+            for day in range(
+                1,
+                days_in_month + 1,
+            ):
+                revenue_data = daily_revenue_rows.get(
+                    (month, day),
+                    {
+                        "orders": 0,
+                        "revenue": Decimal("0.00"),
+                    },
+                )
+
+                inventory_data = daily_inventory_rows.get(
+                    (month, day),
+                    {
+                        "units_used": 0,
+                        "inventory_value": Decimal("0.00"),
+                    },
+                )
+
+                daily_revenue = revenue_data["revenue"]
+
+                daily_material_cost = inventory_data["inventory_value"]
+
+                daily_profit = daily_revenue - daily_material_cost
+
+                daily.append(
+                    {
+                        "day": day,
+                        "date": date(
+                            year,
+                            month,
+                            day,
+                        ).isoformat(),
+                        "orders": revenue_data["orders"],
+                        "revenue": daily_revenue,
+                        "material_cost": (daily_material_cost),
+                        "profit": daily_profit,
+                        "inventory_units_used": (inventory_data["units_used"]),
+                        "inventory_value_used": (daily_material_cost),
+                    }
+                )
 
             monthly.append(
                 {
                     "month": month,
                     "month_name": month_name[month],
-                    "orders": revenue_data["orders"],
+                    "orders": monthly_revenue["orders"],
                     "revenue": revenue,
                     "material_cost": material_cost,
-                    "designer_cost": designer_cost,
-                    "profit": profit,
-                    "inventory_units_used": inventory_data["units_used"],
-                    "inventory_value_used": material_cost,
+                    "profit": monthly_profit,
+                    "inventory_units_used": (monthly_inventory["units_used"]),
+                    "inventory_value_used": (material_cost),
+                    "daily": daily,
                 }
             )
 
         return {
             "monthly": monthly,
-            "designers": designer_rows,
         }
