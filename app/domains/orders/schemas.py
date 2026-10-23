@@ -19,33 +19,46 @@ class OrderInventoryItemCreate(BaseModel):
     Inventory material selected while creating an order.
 
     Examples:
-
         Plain quantity:
             quantity = 12
 
         Dimension input:
-            input_quantity = "3*4"
+            input_quantity = "3x2"
 
-        For a feet-based inventory item:
-            "3*4" -> 12 feet
+        Dimensions with copies:
+            input_quantity = "3x2x2"
+
+        Multiple expressions:
+            input_quantity = "3x2x2, 4x5x3"
+
+    Dimension expressions are calculated only for inventory
+    items measured in feet.
+
+    discount_amount is a fixed monetary discount per unit,
+    not a percentage.
     """
 
     inventory_item_id: UUID
 
-    # Used when the frontend already has a plain numeric quantity.
+    # Used when the frontend provides a plain numeric quantity.
     quantity: int | None = Field(
         default=None,
         gt=0,
     )
 
-    # What the staff actually typed.
-    #
-    # Examples:
-    #   "12"
-    #   "3*4"
-    #   "3 x 4"
-    #   "3×4"
-    input_quantity: str | None = None
+    # Exact quantity or dimension expression entered by staff.
+    input_quantity: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+    )
+
+    # Fixed discount applied to each inventory unit.
+    discount_amount: Decimal = Field(
+        default=Decimal("0.00"),
+        ge=0,
+        decimal_places=2,
+    )
 
 
 # ============================================================
@@ -82,22 +95,36 @@ class OrderCreate(BaseModel):
 
 class OrderInventoryItemUpdate(BaseModel):
     inventory_item_id: UUID
+
+    # Preserve the exact staff input when updating an order.
     input_quantity: str = Field(
         min_length=1,
-        max_length=100,
+        max_length=500,
+    )
+
+    # Fixed discount per inventory unit.
+    discount_amount: Decimal = Field(
+        default=Decimal("0.00"),
+        ge=0,
+        decimal_places=2,
     )
 
 
 class OrderUpdate(BaseModel):
     title: str | None = None
+
     description: str | None = None
+
     order_type: OrderType | None = None
+
     status: OrderStatus | None = None
+
     total_amount: Decimal | None = Field(
         default=None,
         ge=0,
         decimal_places=2,
     )
+
     due_date: date | None = None
 
     inventory_items: list[OrderInventoryItemUpdate] | None = None
@@ -152,14 +179,11 @@ class OrderResponse(BaseModel):
     customer: OrderCustomerResponse
 
     order_type: OrderType
-
     title: str
     description: str | None
-
     status: OrderStatus
 
     total_amount: Decimal
-
     due_date: date | None
 
     files: list[OrderFileResponse] = Field(

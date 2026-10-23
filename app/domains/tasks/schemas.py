@@ -157,8 +157,6 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     deadline: datetime | None
 
-    designer_charge: Decimal
-
     created_at: datetime
 
 
@@ -170,11 +168,6 @@ class TaskResponse(BaseModel):
 class TaskReview(BaseModel):
     approve: bool
     message: str | None = None
-    designer_charge: Decimal = Field(
-        default=Decimal("0.00"),
-        ge=0,
-        decimal_places=2,
-    )
 
 
 # ============================================================

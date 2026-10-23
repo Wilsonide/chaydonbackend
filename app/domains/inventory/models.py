@@ -1,6 +1,14 @@
 import enum
+from decimal import Decimal
 
-from sqlalchemy import Enum, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import (
+    Enum,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+)
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -45,9 +53,9 @@ class InventoryItem(UUIDMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    unit_selling_price: Mapped[float] = mapped_column(
+    unit_selling_price: Mapped[Decimal] = mapped_column(
         Numeric(12, 2),
-        default=0,
+        default=Decimal("0.00"),
         nullable=False,
     )
 
@@ -57,8 +65,8 @@ class InventoryItem(UUIDMixin, TimestampMixin, Base):
     )
 
     @hybrid_property
-    def total_selling_price(self):
-        return self.quantity * self.unit_selling_price
+    def total_selling_price(self) -> Decimal:
+        return Decimal(self.quantity) * Decimal(str(self.unit_selling_price or 0))
 
     movements = relationship(
         "StockMovement",
@@ -94,9 +102,25 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    unit_selling_price: Mapped[float] = mapped_column(
+    # Original unit selling price before any discount.
+    unit_selling_price: Mapped[Decimal] = mapped_column(
         Numeric(12, 2),
         nullable=False,
+    )
+
+    # Fixed monetary discount per unit, not a percentage.
+    discount_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        default=Decimal("0.00"),
+        server_default="0.00",
+        nullable=False,
+    )
+
+    # Original dimension input, e.g. "3x2x2, 4x5x3".
+    # Nullable to preserve compatibility with older movements.
+    dimension_input: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
     )
 
     reason: Mapped[str | None] = mapped_column(
@@ -122,9 +146,7 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
         index=True,
     )
 
-    # --------------------------------------------------------
-    # PRINT ORDER
-    # --------------------------------------------------------
+    # Associated print order, when applicable.
     order_id: Mapped[str | None] = mapped_column(
         ForeignKey(
             "orders.id",
@@ -135,8 +157,14 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
     )
 
     @hybrid_property
-    def total_selling_price(self):
-        return self.quantity * self.unit_selling_price
+    def discounted_unit_selling_price(self) -> Decimal:
+        price = Decimal(str(self.unit_selling_price or 0))
+        discount = Decimal(str(self.discount_amount or 0))
+        return price - discount
+
+    @hybrid_property
+    def total_selling_price(self) -> Decimal:
+        return Decimal(self.quantity) * self.discounted_unit_selling_price
 
     item = relationship(
         "InventoryItem",
@@ -156,14 +184,9 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
     )
 
 
-# ============================================================
-# PRINT ORDER MATERIAL REQUIREMENT
-# ============================================================
-
-
 class OrderMaterialRequirement(UUIDMixin, TimestampMixin, Base):
     """
-    Defines the inventory materials required by a PRINT order.
+    Defines the inventory materials required by a print order.
 
     required_quantity:
         Total quantity required for the order.
@@ -206,25 +229,46 @@ class OrderMaterialRequirement(UUIDMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    unit_selling_price: Mapped[float] = mapped_column(
+    # Original unit selling price before discount.
+    unit_selling_price: Mapped[Decimal] = mapped_column(
         Numeric(12, 2),
         nullable=False,
     )
 
+    # Fixed monetary discount per unit.
+    discount_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        default=Decimal("0.00"),
+        server_default="0.00",
+        nullable=False,
+    )
+
+    # Original dimension input, e.g. "3x2x2, 4x5x3".
+    dimension_input: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+    )
+
     @hybrid_property
-    def remaining_quantity(self):
+    def remaining_quantity(self) -> int:
         return max(
             self.required_quantity - self.consumed_quantity,
             0,
         )
 
     @hybrid_property
-    def required_cost(self):
-        return self.required_quantity * self.unit_selling_price
+    def discounted_unit_selling_price(self) -> Decimal:
+        price = Decimal(str(self.unit_selling_price or 0))
+        discount = Decimal(str(self.discount_amount or 0))
+        return price - discount
 
     @hybrid_property
-    def consumed_cost(self):
-        return self.consumed_quantity * self.unit_selling_price
+    def required_cost(self) -> Decimal:
+        return Decimal(self.required_quantity) * self.discounted_unit_selling_price
+
+    @hybrid_property
+    def consumed_cost(self) -> Decimal:
+        return Decimal(self.consumed_quantity) * self.discounted_unit_selling_price
 
     order = relationship(
         "Order",

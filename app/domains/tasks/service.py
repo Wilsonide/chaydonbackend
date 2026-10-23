@@ -749,7 +749,6 @@ class TaskService:
         reviewer_id,
         approve,
         message,
-        designer_charge,
     ):
         task = await self.repo.get_basic_by_id(
             db,
@@ -771,34 +770,12 @@ class TaskService:
         # ------------------------------------------------------------
         # APPROVAL
         # ------------------------------------------------------------
-
         if approve:
-            if designer_charge is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Designer charge is required when approving a task",
-                )
-
-            if designer_charge < 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Designer charge cannot be negative",
-                )
-
             task.status = TaskStatus.APPROVED
-
-            # --------------------------------------------------------
-            # SAVE DESIGNER CHARGE
-            # --------------------------------------------------------
-
-            task.designer_charge = designer_charge
 
             action = "TASK_APPROVED"
 
-            description = (
-                f"Task '{task.title}' was approved. "
-                f"Designer charge: {designer_charge:.2f}."
-            )
+            description = f"Task '{task.title}' was approved."
 
             comment_message = (
                 message.strip()
@@ -809,7 +786,6 @@ class TaskService:
         # ------------------------------------------------------------
         # REVISION
         # ------------------------------------------------------------
-
         else:
             task.status = TaskStatus.REVISION_REQUIRED
 
@@ -826,7 +802,6 @@ class TaskService:
         # ------------------------------------------------------------
         # COMMENT
         # ------------------------------------------------------------
-
         comment = TaskComment(
             task_id=task.id,
             user_id=reviewer_id,
@@ -836,7 +811,6 @@ class TaskService:
         # ------------------------------------------------------------
         # ACTIVITY
         # ------------------------------------------------------------
-
         activity = ProductionActivity(
             production_folder_id=task.production_folder_id,
             user_id=reviewer_id,
@@ -850,7 +824,6 @@ class TaskService:
         # ------------------------------------------------------------
         # SYNCHRONIZE TASK → PRODUCTION → ORDER
         # ------------------------------------------------------------
-
         await self._sync_workflow_status(
             db,
             task,

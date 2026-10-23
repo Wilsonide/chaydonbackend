@@ -333,7 +333,6 @@ async def review_task(
         str(current_user.id),
         data.approve,
         data.message,
-        data.designer_charge,
     )
 
 
