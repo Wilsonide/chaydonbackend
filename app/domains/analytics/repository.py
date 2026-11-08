@@ -2,345 +2,204 @@ from calendar import month_name
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import extract, func, select
+from sqlalchemy import extract, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domains.inventory.models import MovementType, StockMovement
+from app.domains.analytics.schemas import (
+    DailyAnalytics,
+    MonthlyAnalytics,
+)
+from app.domains.invoices.models import Invoice, InvoiceStatus
 from app.domains.orders.models import Order, OrderStatus
 
 
+ZERO = Decimal("0.00")
+
+
+def to_decimal(value) -> Decimal:
+    return Decimal(str(value or ZERO)).quantize(Decimal("0.01"))
+
+
 class AnalyticsRepository:
+
     async def get_yearly_analytics(
         self,
         db: AsyncSession,
         year: int,
     ) -> dict:
         """
-        Build yearly analytics with monthly and daily drill-down.
+        Build yearly business revenue analytics.
 
-        Revenue:
-            Order.total_amount
+        Order value:
+            Invoice.total_amount grouped by order creation date.
 
-        Material cost:
-            Linked STOCK_OUT movements for completed orders.
+        Revenue received:
+            Same as order value. Every valid print order contributes
+            its full invoice value to revenue received.
 
-        Profit:
-            Revenue - material cost
+        Outstanding balance:
+            Invoice.balance_due grouped by order creation date.
 
-        Inventory consumption is attributed to the
-        completion date of the related order.
+        Cancelled orders and void invoices are excluded from
+        order value, revenue received, and outstanding balance.
         """
 
-        # =========================================================
-        # 1. Monthly revenue
-        # =========================================================
+        # =====================================================
+        # 1. Order value and outstanding balance
+        # =====================================================
 
-        monthly_revenue_query = (
+        order_month = extract("month", Order.created_at)
+        order_day = extract("day", Order.created_at)
+
+        valid_invoice = or_(
+            Invoice.id.is_(None),
+            Invoice.status != InvoiceStatus.VOID,
+        )
+
+        order_analytics_query = (
             select(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ).label("month"),
+                order_month.label("month"),
+                order_day.label("day"),
                 func.count(Order.id).label("orders"),
                 func.coalesce(
-                    func.sum(Order.total_amount),
-                    0,
-                ).label("revenue"),
+                    func.sum(Invoice.total_amount),
+                    ZERO,
+                ).label("order_value"),
+                func.coalesce(
+                    func.sum(Invoice.balance_due),
+                    ZERO,
+                ).label("outstanding_balance"),
+            )
+            .outerjoin(
+                Invoice,
+                Invoice.order_id == Order.id,
             )
             .where(
-                Order.status == OrderStatus.COMPLETED,
-                Order.completed_at.is_not(None),
-                extract("year", Order.completed_at) == year,
+                Order.status != OrderStatus.CANCELLED,
+                extract("year", Order.created_at) == year,
+                valid_invoice,
             )
             .group_by(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ),
+                order_month,
+                order_day,
             )
         )
 
-        monthly_revenue_result = await db.execute(monthly_revenue_query)
+        order_result = await db.execute(order_analytics_query)
 
-        monthly_revenue_rows = {
-            int(row.month): {
-                "orders": int(row.orders),
-                "revenue": Decimal(str(row.revenue or 0)),
+        order_rows = {
+            (int(row.month), int(row.day)): {
+                "orders": int(row.orders or 0),
+                "order_value": to_decimal(row.order_value),
+                "outstanding_balance": to_decimal(
+                    row.outstanding_balance
+                ),
             }
-            for row in monthly_revenue_result
+            for row in order_result
         }
 
-        # =========================================================
-        # 2. Monthly inventory/material cost
-        # =========================================================
-
-        monthly_inventory_query = (
-            select(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ).label("month"),
-                func.coalesce(
-                    func.sum(StockMovement.quantity),
-                    0,
-                ).label("units_used"),
-                func.coalesce(
-                    func.sum(StockMovement.quantity * StockMovement.unit_selling_price),
-                    0,
-                ).label("inventory_value"),
-            )
-            .join(
-                Order,
-                Order.id == StockMovement.order_id,
-            )
-            .where(
-                Order.status == OrderStatus.COMPLETED,
-                Order.completed_at.is_not(None),
-                StockMovement.movement_type == MovementType.STOCK_OUT,
-                extract(
-                    "year",
-                    Order.completed_at,
-                )
-                == year,
-            )
-            .group_by(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ),
-            )
-        )
-
-        monthly_inventory_result = await db.execute(monthly_inventory_query)
-
-        monthly_inventory_rows = {
-            int(row.month): {
-                "units_used": int(row.units_used or 0),
-                "inventory_value": Decimal(str(row.inventory_value or 0)),
-            }
-            for row in monthly_inventory_result
-        }
-
-        # =========================================================
-        # 3. Daily revenue
-        # =========================================================
-
-        daily_revenue_query = (
-            select(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ).label("month"),
-                extract(
-                    "day",
-                    Order.completed_at,
-                ).label("day"),
-                func.count(Order.id).label("orders"),
-                func.coalesce(
-                    func.sum(Order.total_amount),
-                    0,
-                ).label("revenue"),
-            )
-            .where(
-                Order.status == OrderStatus.COMPLETED,
-                Order.completed_at.is_not(None),
-                extract("year", Order.completed_at) == year,
-            )
-            .group_by(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ),
-                extract(
-                    "day",
-                    Order.completed_at,
-                ),
-            )
-        )
-
-        daily_revenue_result = await db.execute(daily_revenue_query)
-
-        daily_revenue_rows = {
-            (
-                int(row.month),
-                int(row.day),
-            ): {
-                "orders": int(row.orders),
-                "revenue": Decimal(str(row.revenue or 0)),
-            }
-            for row in daily_revenue_result
-        }
-
-        # =========================================================
-        # 4. Daily inventory/material cost
-        # =========================================================
-
-        daily_inventory_query = (
-            select(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ).label("month"),
-                extract(
-                    "day",
-                    Order.completed_at,
-                ).label("day"),
-                func.coalesce(
-                    func.sum(StockMovement.quantity),
-                    0,
-                ).label("units_used"),
-                func.coalesce(
-                    func.sum(StockMovement.quantity * StockMovement.unit_selling_price),
-                    0,
-                ).label("inventory_value"),
-            )
-            .join(
-                Order,
-                Order.id == StockMovement.order_id,
-            )
-            .where(
-                Order.status == OrderStatus.COMPLETED,
-                Order.completed_at.is_not(None),
-                StockMovement.movement_type == MovementType.STOCK_OUT,
-                extract(
-                    "year",
-                    Order.completed_at,
-                )
-                == year,
-            )
-            .group_by(
-                extract(
-                    "month",
-                    Order.completed_at,
-                ),
-                extract(
-                    "day",
-                    Order.completed_at,
-                ),
-            )
-        )
-
-        daily_inventory_result = await db.execute(daily_inventory_query)
-
-        daily_inventory_rows = {
-            (
-                int(row.month),
-                int(row.day),
-            ): {
-                "units_used": int(row.units_used or 0),
-                "inventory_value": Decimal(str(row.inventory_value or 0)),
-            }
-            for row in daily_inventory_result
-        }
-
-        # =========================================================
-        # 5. Build monthly + daily structure
-        # =========================================================
+        # =====================================================
+        # 2. Build monthly and daily analytics
+        # =====================================================
 
         monthly = []
 
+        total_orders = 0
+        total_order_value = ZERO
+        total_revenue_received = ZERO
+        total_outstanding_balance = ZERO
+
         for month in range(1, 13):
-            monthly_revenue = monthly_revenue_rows.get(
-                month,
-                {
-                    "orders": 0,
-                    "revenue": Decimal("0.00"),
-                },
-            )
-
-            monthly_inventory = monthly_inventory_rows.get(
-                month,
-                {
-                    "units_used": 0,
-                    "inventory_value": Decimal("0.00"),
-                },
-            )
-
-            revenue = monthly_revenue["revenue"]
-            material_cost = monthly_inventory["inventory_value"]
-
-            monthly_profit = revenue - material_cost
-
-            # -----------------------------------------------------
-            # Determine number of days in the month
-            # -----------------------------------------------------
 
             if month == 12:
                 next_month = date(year + 1, 1, 1)
             else:
                 next_month = date(year, month + 1, 1)
 
-            current_month = date(
-                year,
-                month,
-                1,
-            )
+            current_month = date(year, month, 1)
 
-            days_in_month = (next_month - current_month).days
+            days_in_month = (
+                next_month - current_month
+            ).days
 
-            # -----------------------------------------------------
-            # Build daily analytics
-            # -----------------------------------------------------
+            monthly_orders = 0
+            monthly_order_value = ZERO
+            monthly_revenue_received = ZERO
+            monthly_outstanding_balance = ZERO
 
             daily = []
 
-            for day in range(
-                1,
-                days_in_month + 1,
-            ):
-                revenue_data = daily_revenue_rows.get(
-                    (month, day),
+            for day in range(1, days_in_month + 1):
+
+                key = (month, day)
+
+                order_data = order_rows.get(
+                    key,
                     {
                         "orders": 0,
-                        "revenue": Decimal("0.00"),
+                        "order_value": ZERO,
+                        "outstanding_balance": ZERO,
                     },
                 )
 
-                inventory_data = daily_inventory_rows.get(
-                    (month, day),
-                    {
-                        "units_used": 0,
-                        "inventory_value": Decimal("0.00"),
-                    },
-                )
+                order_value = order_data["order_value"]
 
-                daily_revenue = revenue_data["revenue"]
+                # Revenue received is defined as the full value
+                # of print orders, not actual payment collections.
+                revenue_received = order_value
 
-                daily_material_cost = inventory_data["inventory_value"]
-
-                daily_profit = daily_revenue - daily_material_cost
+                outstanding_balance = order_data[
+                    "outstanding_balance"
+                ]
 
                 daily.append(
-                    {
-                        "day": day,
-                        "date": date(
+                    DailyAnalytics(
+                        day=day,
+                        date=date(
                             year,
                             month,
                             day,
                         ).isoformat(),
-                        "orders": revenue_data["orders"],
-                        "revenue": daily_revenue,
-                        "material_cost": (daily_material_cost),
-                        "profit": daily_profit,
-                        "inventory_units_used": (inventory_data["units_used"]),
-                        "inventory_value_used": (daily_material_cost),
-                    }
+                        orders=order_data["orders"],
+                        order_value=order_value,
+                        revenue_received=revenue_received,
+                        outstanding_balance=outstanding_balance,
+                    )
                 )
 
+                monthly_orders += order_data["orders"]
+
+                monthly_order_value += order_value
+
+                monthly_revenue_received += revenue_received
+
+                monthly_outstanding_balance += outstanding_balance
+
             monthly.append(
-                {
-                    "month": month,
-                    "month_name": month_name[month],
-                    "orders": monthly_revenue["orders"],
-                    "revenue": revenue,
-                    "material_cost": material_cost,
-                    "profit": monthly_profit,
-                    "inventory_units_used": (monthly_inventory["units_used"]),
-                    "inventory_value_used": (material_cost),
-                    "daily": daily,
-                }
+                MonthlyAnalytics(
+                    month=month,
+                    month_name=month_name[month],
+                    orders=monthly_orders,
+                    order_value=monthly_order_value,
+                    revenue_received=monthly_revenue_received,
+                    outstanding_balance=monthly_outstanding_balance,
+                    daily=daily,
+                )
             )
 
+            total_orders += monthly_orders
+            total_order_value += monthly_order_value
+            total_revenue_received += monthly_revenue_received
+            total_outstanding_balance += monthly_outstanding_balance
+
+        # =====================================================
+        # 3. Return yearly analytics
+        # =====================================================
+
         return {
+            "total_orders": total_orders,
+            "total_order_value": total_order_value,
+            "total_revenue_received": total_revenue_received,
+            "total_outstanding_balance": total_outstanding_balance,
             "monthly": monthly,
         }

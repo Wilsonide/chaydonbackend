@@ -8,6 +8,7 @@ from app.domains.analytics.schemas import AnalyticsSummary
 from app.domains.analytics.service import AnalyticsService
 from app.domains.auth.permissions import RequireSuperAdmin
 
+
 router = APIRouter(
     prefix="/analytics",
     tags=["Analytics"],
@@ -39,6 +40,6 @@ async def get_yearly_analytics(
     ],
 ):
     return await service.get_yearly_analytics(
-        db,
-        year,
+        db=db,
+        year=year,
     )

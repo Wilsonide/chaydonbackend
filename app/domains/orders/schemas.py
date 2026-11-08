@@ -34,8 +34,9 @@ class OrderInventoryItemCreate(BaseModel):
     Dimension expressions are calculated only for inventory
     items measured in feet.
 
-    discount_amount is a fixed monetary discount per unit,
-    not a percentage.
+    discount_amount is one fixed monetary discount applied
+    to the entire required material quantity, not per unit
+    and not a percentage.
     """
 
     inventory_item_id: UUID
@@ -53,7 +54,7 @@ class OrderInventoryItemCreate(BaseModel):
         max_length=500,
     )
 
-    # Fixed discount applied to each inventory unit.
+    # One fixed discount for the entire material requirement.
     discount_amount: Decimal = Field(
         default=Decimal("0.00"),
         ge=0,
@@ -102,7 +103,8 @@ class OrderInventoryItemUpdate(BaseModel):
         max_length=500,
     )
 
-    # Fixed discount per inventory unit.
+    # New fixed discount for the entire updated requirement.
+    # Staff can change this independently of the quantity.
     discount_amount: Decimal = Field(
         default=Decimal("0.00"),
         ge=0,

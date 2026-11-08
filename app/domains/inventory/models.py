@@ -1,5 +1,5 @@
 import enum
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import (
     Enum,
@@ -83,6 +83,8 @@ class InventoryItem(UUIDMixin, TimestampMixin, Base):
 class StockMovement(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "stock_movements"
 
+    MONEY = Decimal("0.01")
+
     item_id: Mapped[str] = mapped_column(
         ForeignKey(
             "inventory_items.id",
@@ -102,13 +104,13 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    # Original unit selling price before any discount.
+    # Original unit selling price before discount.
     unit_selling_price: Mapped[Decimal] = mapped_column(
         Numeric(12, 2),
         nullable=False,
     )
 
-    # Fixed monetary discount per unit, not a percentage.
+    # Overall fixed monetary discount allocated to this movement.
     discount_amount: Mapped[Decimal] = mapped_column(
         Numeric(12, 2),
         default=Decimal("0.00"),
@@ -117,7 +119,6 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
     )
 
     # Original dimension input, e.g. "3x2x2, 4x5x3".
-    # Nullable to preserve compatibility with older movements.
     dimension_input: Mapped[str | None] = mapped_column(
         String(500),
         nullable=True,
@@ -146,7 +147,6 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
         index=True,
     )
 
-    # Associated print order, when applicable.
     order_id: Mapped[str | None] = mapped_column(
         ForeignKey(
             "orders.id",
@@ -157,14 +157,16 @@ class StockMovement(UUIDMixin, TimestampMixin, Base):
     )
 
     @hybrid_property
-    def discounted_unit_selling_price(self) -> Decimal:
-        price = Decimal(str(self.unit_selling_price or 0))
-        discount = Decimal(str(self.discount_amount or 0))
-        return price - discount
+    def gross_total_selling_price(self) -> Decimal:
+        return (
+            Decimal(self.quantity) * Decimal(str(self.unit_selling_price or 0))
+        ).quantize(self.MONEY, rounding=ROUND_HALF_UP)
 
     @hybrid_property
     def total_selling_price(self) -> Decimal:
-        return Decimal(self.quantity) * self.discounted_unit_selling_price
+        return (
+            self.gross_total_selling_price - Decimal(str(self.discount_amount or 0))
+        ).quantize(self.MONEY, rounding=ROUND_HALF_UP)
 
     item = relationship(
         "InventoryItem",
@@ -196,9 +198,15 @@ class OrderMaterialRequirement(UUIDMixin, TimestampMixin, Base):
 
     remaining_quantity:
         Quantity still required.
+
+    discount_amount:
+        One fixed monetary discount applied to the entire
+        required material quantity.
     """
 
     __tablename__ = "order_material_requirements"
+
+    MONEY = Decimal("0.01")
 
     order_id: Mapped[str] = mapped_column(
         ForeignKey(
@@ -235,7 +243,7 @@ class OrderMaterialRequirement(UUIDMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    # Fixed monetary discount per unit.
+    # One fixed monetary discount for the entire requirement.
     discount_amount: Mapped[Decimal] = mapped_column(
         Numeric(12, 2),
         default=Decimal("0.00"),
@@ -243,7 +251,6 @@ class OrderMaterialRequirement(UUIDMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    # Original dimension input, e.g. "3x2x2, 4x5x3".
     dimension_input: Mapped[str | None] = mapped_column(
         String(500),
         nullable=True,
@@ -257,18 +264,75 @@ class OrderMaterialRequirement(UUIDMixin, TimestampMixin, Base):
         )
 
     @hybrid_property
-    def discounted_unit_selling_price(self) -> Decimal:
-        price = Decimal(str(self.unit_selling_price or 0))
-        discount = Decimal(str(self.discount_amount or 0))
-        return price - discount
+    def gross_required_cost(self) -> Decimal:
+        return (
+            Decimal(self.required_quantity) * Decimal(str(self.unit_selling_price or 0))
+        ).quantize(self.MONEY, rounding=ROUND_HALF_UP)
 
     @hybrid_property
     def required_cost(self) -> Decimal:
-        return Decimal(self.required_quantity) * self.discounted_unit_selling_price
+        return (
+            self.gross_required_cost - Decimal(str(self.discount_amount or 0))
+        ).quantize(self.MONEY, rounding=ROUND_HALF_UP)
 
-    @hybrid_property
+    @property
+    def consumed_discount(self) -> Decimal:
+        """
+        Allocate the overall discount proportionally to.
+
+        the quantity already consumed.
+
+        When all quantity is consumed, allocate the full
+        discount to avoid rounding discrepancies.
+        """
+        if self.required_quantity <= 0:
+            return Decimal("0.00")
+
+        consumed = min(
+            max(self.consumed_quantity, 0),
+            self.required_quantity,
+        )
+
+        if consumed == 0:
+            return Decimal("0.00")
+
+        if consumed == self.required_quantity:
+            return Decimal(str(self.discount_amount or 0)).quantize(
+                self.MONEY,
+                rounding=ROUND_HALF_UP,
+            )
+
+        return (
+            Decimal(str(self.discount_amount or 0))
+            * Decimal(consumed)
+            / Decimal(self.required_quantity)
+        ).quantize(self.MONEY, rounding=ROUND_HALF_UP)
+
+    @property
     def consumed_cost(self) -> Decimal:
-        return Decimal(self.consumed_quantity) * self.discounted_unit_selling_price
+        consumed = min(
+            max(self.consumed_quantity, 0),
+            self.required_quantity,
+        )
+
+        gross_cost = Decimal(consumed) * Decimal(str(self.unit_selling_price or 0))
+
+        return (gross_cost - self.consumed_discount).quantize(
+            self.MONEY,
+            rounding=ROUND_HALF_UP,
+        )
+
+    @property
+    def remaining_cost(self) -> Decimal:
+        return (self.required_cost - self.consumed_cost).quantize(
+            self.MONEY, rounding=ROUND_HALF_UP
+        )
+
+    @property
+    def remaining_discount(self) -> Decimal:
+        return (
+            Decimal(str(self.discount_amount or 0)) - self.consumed_discount
+        ).quantize(self.MONEY, rounding=ROUND_HALF_UP)
 
     order = relationship(
         "Order",

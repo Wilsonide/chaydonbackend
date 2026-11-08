@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -342,24 +344,23 @@ class InventoryService:
             order_id,
         )
 
-        total_required_cost = 0
-        total_consumed_cost = 0
-        total_remaining_cost = 0
+        total_required_cost = Decimal("0.00")
+        total_consumed_cost = Decimal("0.00")
+        total_remaining_cost = Decimal("0.00")
+        total_discount = Decimal("0.00")
 
         for requirement in requirements:
-            unit_price = float(requirement.unit_selling_price)
-
-            total_required_cost += requirement.required_quantity * unit_price
-
-            total_consumed_cost += requirement.consumed_quantity * unit_price
-
-            total_remaining_cost += requirement.remaining_quantity * unit_price
+            total_required_cost += requirement.required_cost
+            total_consumed_cost += requirement.consumed_cost
+            total_remaining_cost += requirement.remaining_cost
+            total_discount += Decimal(str(requirement.discount_amount or 0))
 
         return {
             "order_id": order.id,
             "total_required_cost": total_required_cost,
             "total_consumed_cost": total_consumed_cost,
             "total_remaining_cost": total_remaining_cost,
+            "total_discount": total_discount,
             "requirements": requirements,
         }
 
@@ -403,6 +404,7 @@ class InventoryService:
             required_quantity=data.required_quantity,
             consumed_quantity=0,
             unit_selling_price=item.unit_selling_price,
+            discount_amount=Decimal("0.00"),
         )
 
         try:
@@ -442,21 +444,17 @@ class InventoryService:
         """
         Consume all remaining material requirements for an order.
 
-        Works for both:
-            - PRINT orders
-            - DESIGN orders that have completed their design workflow
+        Supports PRINT orders and DESIGN orders that have completed
+        their design workflow.
 
-        All inventory items are locked before deduction so that
-        concurrent consumption cannot oversell stock.
+        All inventory items are locked before deduction.
 
-        The stock movement reason is stored as:
-
-            Material consumed for order [order title] by [customer name]
+        Each stock movement records only the discount allocated
+        to the quantity consumed during that operation.
         """
         # --------------------------------------------------------
         # GET ORDER WITH CUSTOMER
         # --------------------------------------------------------
-
         result = await db.execute(
             select(Order)
             .options(selectinload(Order.customer))
@@ -474,7 +472,6 @@ class InventoryService:
         # --------------------------------------------------------
         # GET MATERIAL REQUIREMENTS
         # --------------------------------------------------------
-
         requirements = await self.repo.get_order_material_requirements(
             db,
             order_id,
@@ -489,7 +486,6 @@ class InventoryService:
         # --------------------------------------------------------
         # FIND REQUIREMENTS STILL NEEDING CONSUMPTION
         # --------------------------------------------------------
-
         pending_requirements = [
             requirement
             for requirement in requirements
@@ -504,11 +500,7 @@ class InventoryService:
 
         # --------------------------------------------------------
         # LOCK INVENTORY ITEMS
-        #
-        # Sort by inventory ID first so concurrent transactions
-        # acquire locks in a consistent order.
         # --------------------------------------------------------
-
         pending_requirements.sort(
             key=lambda requirement: str(requirement.inventory_item_id)
         )
@@ -528,7 +520,7 @@ class InventoryService:
                     if not item:
                         raise HTTPException(
                             status_code=404,
-                            detail=(f"Inventory item {item_id} not found"),
+                            detail=f"Inventory item {item_id} not found",
                         )
 
                     locked_items[item_id] = item
@@ -536,7 +528,6 @@ class InventoryService:
             # ----------------------------------------------------
             # CHECK ALL STOCK BEFORE MAKING ANY DEDUCTIONS
             # ----------------------------------------------------
-
             for requirement in pending_requirements:
                 item = locked_items[str(requirement.inventory_item_id)]
 
@@ -556,8 +547,9 @@ class InventoryService:
             # ----------------------------------------------------
             # BUILD MOVEMENT REASON
             # ----------------------------------------------------
-
-            customer_name = order.customer.name
+            customer_name = (
+                order.customer.name if order.customer else "Unknown customer"
+            )
 
             movement_reason = (
                 f"Material consumed for order {order.title} by {customer_name}"
@@ -568,24 +560,39 @@ class InventoryService:
             # ----------------------------------------------------
             # DEDUCT STOCK
             # ----------------------------------------------------
-
             for requirement in pending_requirements:
                 item = locked_items[str(requirement.inventory_item_id)]
 
                 consumed_quantity = requirement.remaining_quantity
 
-                # Deduct inventory
+                # Capture the discount already allocated to previously
+                # consumed quantities.
+                previous_consumed_discount = requirement.consumed_discount
+
+                # Deduct inventory.
                 item.quantity -= consumed_quantity
 
-                # Update requirement
+                # Update requirement consumption.
                 requirement.consumed_quantity += consumed_quantity
 
-                # Create movement
+                # Calculate the additional discount allocated by
+                # this consumption operation.
+                new_consumed_discount = requirement.consumed_discount
+
+                movement_discount = new_consumed_discount - previous_consumed_discount
+
+                movement_discount = max(
+                    movement_discount,
+                    Decimal("0.00"),
+                )
+
+                # Create stock movement.
                 movement = StockMovement(
                     item_id=item.id,
                     quantity=consumed_quantity,
                     movement_type=MovementType.STOCK_OUT,
-                    unit_selling_price=item.unit_selling_price,
+                    unit_selling_price=requirement.unit_selling_price,
+                    discount_amount=movement_discount,
                     reason=movement_reason,
                     recorded_by=user_id,
                     order_id=order.id,
@@ -600,13 +607,11 @@ class InventoryService:
             # ----------------------------------------------------
             # COMMIT EVERYTHING TOGETHER
             # ----------------------------------------------------
-
             await db.commit()
 
             # ----------------------------------------------------
             # REFRESH MOVEMENTS
             # ----------------------------------------------------
-
             for movement in movements:
                 await db.refresh(movement)
 

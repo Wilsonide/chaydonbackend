@@ -1,37 +1,38 @@
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DailyAnalytics(BaseModel):
     day: int
     date: str
-    orders: int
-    revenue: Decimal
-    material_cost: Decimal
-    profit: Decimal
-    inventory_units_used: int
-    inventory_value_used: Decimal
+
+    orders: int = 0
+    order_value: Decimal = Decimal("0.00")
+    revenue_received: Decimal = Decimal("0.00")
+    outstanding_balance: Decimal = Decimal("0.00")
 
 
 class MonthlyAnalytics(BaseModel):
     month: int
     month_name: str
-    orders: int
-    revenue: Decimal
-    material_cost: Decimal
-    profit: Decimal
-    inventory_units_used: int
-    inventory_value_used: Decimal
-    daily: list[DailyAnalytics]
+
+    orders: int = 0
+    order_value: Decimal = Decimal("0.00")
+    revenue_received: Decimal = Decimal("0.00")
+    outstanding_balance: Decimal = Decimal("0.00")
+
+    daily: list[DailyAnalytics] = Field(default_factory=list)
 
 
 class AnalyticsSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     year: int
-    total_orders: int
-    total_revenue: Decimal
-    total_material_cost: Decimal
-    total_profit: Decimal
-    total_inventory_units_used: int
-    total_inventory_value_used: Decimal
-    monthly: list[MonthlyAnalytics]
+
+    total_orders: int = 0
+    total_order_value: Decimal = Decimal("0.00")
+    total_revenue_received: Decimal = Decimal("0.00")
+    total_outstanding_balance: Decimal = Decimal("0.00")
+
+    monthly: list[MonthlyAnalytics] = Field(default_factory=list)

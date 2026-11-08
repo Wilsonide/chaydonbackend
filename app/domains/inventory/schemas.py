@@ -81,18 +81,24 @@ class OrderMaterialRequirementResponse(BaseModel):
     # Original unit price before discount.
     unit_selling_price: Decimal
 
-    # Fixed discount per unit.
+    # One fixed monetary discount for the entire requirement.
     discount_amount: Decimal = Decimal("0.00")
 
-    # Price per unit after discount.
-    discounted_unit_selling_price: Decimal
+    # Total material cost before discount.
+    gross_required_cost: Decimal
+
+    # Discount allocated to consumed and remaining quantities.
+    consumed_discount: Decimal
+    remaining_discount: Decimal
+
+    # Material costs after the applicable discount allocation.
+    required_cost: Decimal
+    consumed_cost: Decimal
+    remaining_cost: Decimal
 
     # Original input, e.g. "3x2x2, 4x5x3".
     # None is valid for older records.
     dimension_input: str | None = None
-
-    required_cost: Decimal
-    consumed_cost: Decimal
 
     created_at: datetime
     updated_at: datetime
@@ -103,6 +109,7 @@ class OrderMaterialCalculationResponse(BaseModel):
     total_required_cost: Decimal
     total_consumed_cost: Decimal
     total_remaining_cost: Decimal
+    total_discount: Decimal = Decimal("0.00")
     requirements: list[OrderMaterialRequirementResponse]
 
 
@@ -142,16 +149,14 @@ class StockMovementResponse(BaseModel):
     quantity: int
     movement_type: MovementType
 
-    # Original price before discount.
+    # Original unit price before discount.
     unit_selling_price: Decimal
 
-    # Fixed discount applied per unit.
+    # Fixed monetary discount allocated to this movement.
     discount_amount: Decimal = Decimal("0.00")
 
-    # Final price per unit.
-    discounted_unit_selling_price: Decimal
-
-    # Total quantity multiplied by discounted unit price.
+    # Total movement cost before and after discount.
+    gross_total_selling_price: Decimal
     total_selling_price: Decimal
 
     # Original dimension expression, when recorded.

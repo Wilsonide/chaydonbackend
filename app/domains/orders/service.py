@@ -1,6 +1,6 @@
 import re
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import select
@@ -48,6 +48,16 @@ class OrderService:
         self.production_repo = ProductionRepository()
         self.cloudinary = CloudinaryService()
         self.inventory_repo = InventoryRepository()
+
+    MONEY = Decimal("0.01")
+
+    @classmethod
+    def _money(cls, value) -> Decimal:
+        """Normalize monetary values to two decimal places."""
+        return Decimal(str(value or 0)).quantize(
+            cls.MONEY,
+            rounding=ROUND_HALF_UP,
+        )
 
     # Supports:
     #   3x2
@@ -100,27 +110,41 @@ class OrderService:
 
         return raw
 
-    @staticmethod
+    @classmethod
     def _validate_discount(
+        cls,
         *,
         item: InventoryItem,
         discount_amount: Decimal,
+        required_quantity: int = 1,
     ) -> Decimal:
-        """Validate a fixed monetary discount per inventory unit."""
+        """
+        Validate one fixed monetary discount against the total.
 
+        cost of the requested inventory quantity.
+
+        The discount is applied once to the entire material total,
+        not separately to each inventory unit.
+        """
         try:
-            discount = Decimal(str(discount_amount))
-            price = Decimal(str(item.unit_selling_price or 0))
+            discount = cls._money(discount_amount)
+            unit_price = cls._money(item.unit_selling_price)
         except (InvalidOperation, ValueError, TypeError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid inventory price or discount.",
             ) from exc
 
-        if not discount.is_finite() or not price.is_finite():
+        if not discount.is_finite() or not unit_price.is_finite():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Inventory price and discount must be finite values.",
+            )
+
+        if unit_price < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"'{item.name}' has an invalid unit selling price.",
             )
 
         if discount < Decimal("0.00"):
@@ -129,12 +153,20 @@ class OrderService:
                 detail="Discount cannot be negative.",
             )
 
-        if discount > price:
+        if required_quantity <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Required inventory quantity must be greater than zero.",
+            )
+
+        gross_total = cls._money(unit_price * required_quantity)
+
+        if discount > gross_total:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     f"Discount for '{item.name}' cannot exceed "
-                    f"its unit selling price of ₦{price:.2f}."
+                    f"the total material cost of ₦{gross_total:,.2f}."
                 ),
             )
 
@@ -297,7 +329,6 @@ class OrderService:
         Selected inventory is deducted immediately, matching the existing
         PrintFlow workflow. All database changes are committed together.
         """
-
         customer = await self.customer_repo.get_by_id(
             db,
             str(data.customer_id),
@@ -333,19 +364,30 @@ class OrderService:
             await db.flush()
 
             invoice = Invoice(
-                order_id=order.id,
-                subtotal=data.total_amount,
-                discount=0,
-                tax=0,
-                total_amount=data.total_amount,
-                amount_paid=0,
-                balance_due=data.total_amount,
-                status=(
-                    InvoiceStatus.PAID
-                    if data.total_amount == 0
-                    else InvoiceStatus.UNPAID
-                ),
-            )
+    order_id=order.id,
+    subtotal=data.total_amount,
+    discount=0,
+    tax=0,
+    total_amount=data.total_amount,
+    amount_paid=(
+        data.total_amount
+        if data.order_type == OrderType.PRINT
+        else Decimal("0.00")
+    ),
+    balance_due=(
+        Decimal("0.00")
+        if data.order_type == OrderType.PRINT
+        else data.total_amount
+    ),
+    status=(
+        InvoiceStatus.PAID
+        if data.order_type == OrderType.PRINT
+        or data.total_amount == 0
+        else InvoiceStatus.UNPAID
+    ),
+)
+
+
 
             db.add(invoice)
 
@@ -387,7 +429,7 @@ class OrderService:
                 input_values: dict[str, list[str]] = {}
                 discount_values: dict[str, Decimal] = {}
 
-                # Calculate quantities and validate prices/discounts.
+                # Calculate quantities and normalize discounts.
                 for item_id, materials in requested_items.items():
                     item = locked_items[item_id]
 
@@ -399,10 +441,29 @@ class OrderService:
                             input_quantity=raw_input,
                         )
 
-                        discount = self._validate_discount(
-                            item=item,
-                            discount_amount=material.discount_amount,
-                        )
+                        try:
+                            discount = self._money(material.discount_amount)
+                        except (
+                            InvalidOperation,
+                            ValueError,
+                            TypeError,
+                        ) as exc:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Invalid inventory price or discount.",
+                            ) from exc
+
+                        if not discount.is_finite():
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Discount must be a finite value.",
+                            )
+
+                        if discount < Decimal("0.00"):
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Discount cannot be negative.",
+                            )
 
                         existing_discount = discount_values.get(item_id)
 
@@ -425,7 +486,20 @@ class OrderService:
                             aggregated_items.get(item_id, 0) + quantity
                         )
 
-                        input_values.setdefault(item_id, []).append(raw_input)
+                        input_values.setdefault(
+                            item_id,
+                            [],
+                        ).append(raw_input)
+
+                # Validate each discount against the aggregated material cost.
+                for item_id, required_quantity in aggregated_items.items():
+                    item = locked_items[item_id]
+
+                    discount_values[item_id] = self._validate_discount(
+                        item=item,
+                        discount_amount=discount_values[item_id],
+                        required_quantity=required_quantity,
+                    )
 
                 # Validate all stock before deducting anything.
                 for item_id, required_quantity in aggregated_items.items():
@@ -565,16 +639,12 @@ class OrderService:
         data: OrderUpdate,
         current_user: User,
     ):
-        order = await self.get_by_id(
-            db,
-            order_id,
-        )
+        order = await self.get_by_id(db, order_id)
 
         try:
             # --------------------------------------------------------
             # ORDER TYPE
             # --------------------------------------------------------
-
             if data.order_type is not None:
                 if data.order_type != order.order_type:
                     production_folder = await self.production_repo.get_by_order_id(
@@ -620,7 +690,6 @@ class OrderService:
             # --------------------------------------------------------
             # ORDER TOTAL AND INVOICE
             # --------------------------------------------------------
-
             if data.total_amount is not None:
                 invoice = await self.invoice_repo.get_by_order_id(
                     db,
@@ -650,18 +719,18 @@ class OrderService:
                         invoice.status = InvoiceStatus.PARTIALLY_PAID
                     else:
                         invoice.status = InvoiceStatus.UNPAID
-
                 else:
                     order.total_amount = data.total_amount
 
             # --------------------------------------------------------
             # INVENTORY RECONCILIATION
             # --------------------------------------------------------
-
             if data.inventory_items is not None:
-                # Resolve items and calculate requested quantities.
                 requested_materials: dict[str, dict] = {}
 
+                # ----------------------------------------------------
+                # RESOLVE MATERIALS AND AGGREGATE QUANTITIES
+                # ----------------------------------------------------
                 for material in data.inventory_items:
                     item_id = str(material.inventory_item_id)
 
@@ -683,10 +752,25 @@ class OrderService:
                         input_quantity=raw_input,
                     )
 
-                    discount = self._validate_discount(
-                        item=inventory_item,
-                        discount_amount=material.discount_amount,
-                    )
+                    try:
+                        discount = self._money(material.discount_amount)
+                    except (InvalidOperation, ValueError, TypeError) as exc:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Invalid inventory price or discount.",
+                        ) from exc
+
+                    if not discount.is_finite():
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Discount must be a finite value.",
+                        )
+
+                    if discount < Decimal("0.00"):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Discount cannot be negative.",
+                        )
 
                     if item_id in requested_materials:
                         existing = requested_materials[item_id]
@@ -710,7 +794,9 @@ class OrderService:
                             "discount_amount": discount,
                         }
 
-                # Lock existing requirements.
+                # ----------------------------------------------------
+                # LOCK EXISTING REQUIREMENTS
+                # ----------------------------------------------------
                 current_result = await db.execute(
                     select(OrderMaterialRequirement)
                     .where(OrderMaterialRequirement.order_id == order.id)
@@ -727,7 +813,9 @@ class OrderService:
                     for requirement in current_requirements
                 }
 
-                # Lock all affected inventory items in sorted order.
+                # ----------------------------------------------------
+                # LOCK ALL AFFECTED INVENTORY ITEMS
+                # ----------------------------------------------------
                 affected_item_ids = sorted(
                     set(current_by_item) | set(requested_materials)
                 )
@@ -748,7 +836,21 @@ class OrderService:
 
                     locked_items[item_id] = item
 
-                # Build changes before applying stock updates.
+                # ----------------------------------------------------
+                # VALIDATE DISCOUNTS AGAINST UPDATED TOTAL COST
+                # ----------------------------------------------------
+                for item_id, requested in requested_materials.items():
+                    item = locked_items[item_id]
+
+                    requested["discount_amount"] = self._validate_discount(
+                        item=item,
+                        discount_amount=requested["discount_amount"],
+                        required_quantity=requested["quantity"],
+                    )
+
+                # ----------------------------------------------------
+                # BUILD STOCK CHANGES
+                # ----------------------------------------------------
                 stock_changes: list[dict] = []
 
                 for item_id in affected_item_ids:
@@ -773,7 +875,9 @@ class OrderService:
                         }
                     )
 
-                # Validate all additional stock before deducting.
+                # ----------------------------------------------------
+                # VALIDATE ALL ADDITIONAL STOCK BEFORE DEDUCTIONS
+                # ----------------------------------------------------
                 for change in stock_changes:
                     difference = change["difference"]
 
@@ -792,11 +896,14 @@ class OrderService:
                             ),
                         )
 
-                # Apply each stock adjustment.
+                # ----------------------------------------------------
+                # APPLY STOCK ADJUSTMENTS
+                # ----------------------------------------------------
                 for change in stock_changes:
                     item = change["item"]
                     requirement = change["requirement"]
                     requested = change["requested"]
+
                     requested_quantity = change["requested_quantity"]
                     current_quantity = change["current_quantity"]
                     difference = change["difference"]
@@ -804,7 +911,6 @@ class OrderService:
                     # ------------------------------------------------
                     # MATERIAL REMOVED
                     # ------------------------------------------------
-
                     if requested_quantity == 0:
                         if requirement:
                             if current_quantity > 0:
@@ -818,7 +924,9 @@ class OrderService:
                                         unit_selling_price=(
                                             requirement.unit_selling_price
                                         ),
-                                        discount_amount=(requirement.discount_amount),
+                                        discount_amount=self._money(
+                                            requirement.discount_amount
+                                        ),
                                         dimension_input=(requirement.dimension_input),
                                         reason=(
                                             f"Returned from edited order "
@@ -836,12 +944,12 @@ class OrderService:
                     input_description = self._dimension_input(
                         requested["input_descriptions"]
                     )
-                    discount = requested["discount_amount"]
+
+                    new_discount = requested["discount_amount"]
 
                     # ------------------------------------------------
                     # NEW MATERIAL
                     # ------------------------------------------------
-
                     if requirement is None:
                         item.quantity -= requested_quantity
 
@@ -851,7 +959,7 @@ class OrderService:
                                 quantity=requested_quantity,
                                 movement_type=MovementType.STOCK_OUT,
                                 unit_selling_price=item.unit_selling_price,
-                                discount_amount=discount,
+                                discount_amount=new_discount,
                                 dimension_input=input_description,
                                 reason=(
                                     f"Material added to edited order "
@@ -871,7 +979,7 @@ class OrderService:
                                 required_quantity=requested_quantity,
                                 consumed_quantity=requested_quantity,
                                 unit_selling_price=item.unit_selling_price,
-                                discount_amount=discount,
+                                discount_amount=new_discount,
                                 dimension_input=input_description,
                             )
                         )
@@ -881,17 +989,19 @@ class OrderService:
                     # ------------------------------------------------
                     # EXISTING MATERIAL - MORE REQUIRED
                     # ------------------------------------------------
-
                     if difference > 0:
                         item.quantity -= difference
 
+                        # The existing discount belongs to the existing
+                        # requirement. Do not record it again on the
+                        # additional stock movement.
                         db.add(
                             StockMovement(
                                 item_id=item.id,
                                 quantity=difference,
                                 movement_type=MovementType.STOCK_OUT,
                                 unit_selling_price=item.unit_selling_price,
-                                discount_amount=discount,
+                                discount_amount=Decimal("0.00"),
                                 dimension_input=input_description,
                                 reason=(
                                     f"Additional material used for edited "
@@ -908,11 +1018,26 @@ class OrderService:
                     # ------------------------------------------------
                     # EXISTING MATERIAL - LESS REQUIRED
                     # ------------------------------------------------
-
                     elif difference < 0:
                         returned_quantity = abs(difference)
 
                         item.quantity += returned_quantity
+
+                        old_discount = self._money(requirement.discount_amount)
+
+                        # Allocate the returned share of the old discount.
+                        # Returning the entire quantity returns the full
+                        # discount; partial returns are proportional.
+                        if returned_quantity == current_quantity:
+                            returned_discount = old_discount
+                        elif current_quantity > 0:
+                            returned_discount = self._money(
+                                old_discount
+                                * Decimal(returned_quantity)
+                                / Decimal(current_quantity)
+                            )
+                        else:
+                            returned_discount = Decimal("0.00")
 
                         db.add(
                             StockMovement(
@@ -920,7 +1045,7 @@ class OrderService:
                                 quantity=returned_quantity,
                                 movement_type=MovementType.STOCK_IN,
                                 unit_selling_price=(requirement.unit_selling_price),
-                                discount_amount=requirement.discount_amount,
+                                discount_amount=returned_discount,
                                 dimension_input=requirement.dimension_input,
                                 reason=(
                                     f"Material returned from edited order "
@@ -936,17 +1061,19 @@ class OrderService:
                     # ------------------------------------------------
                     # UPDATE REQUIREMENT
                     # ------------------------------------------------
-
                     requirement.required_quantity = requested_quantity
                     requirement.consumed_quantity = requested_quantity
                     requirement.unit_selling_price = item.unit_selling_price
-                    requirement.discount_amount = discount
+
+                    # The newly entered discount replaces the previous
+                    # discount for the entire updated material quantity.
+                    requirement.discount_amount = new_discount
+
                     requirement.dimension_input = input_description
 
             # --------------------------------------------------------
             # SAVE
             # --------------------------------------------------------
-
             await self.repo.update(db, order)
             await db.flush()
             await db.commit()
